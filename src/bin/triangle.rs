@@ -8,6 +8,7 @@ use std::mem::{align_of, size_of, size_of_val}; // TODO: Remove when bumping MSR
 
 use ash::util::*;
 use ash::vk;
+use rust_vulkan::*;
 
 #[derive(Clone, Debug, Copy)]
 struct Vertex {
@@ -200,8 +201,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             .bind_buffer_memory(vertex_input_buffer, vertex_input_buffer_memory, 0)
             .unwrap();
         let mut vertex_spv_file =
-            Cursor::new(&include_bytes!("../../shader/triangle/vert.spv")[..]);
-        let mut frag_spv_file = Cursor::new(&include_bytes!("../../shader/triangle/frag.spv")[..]);
+            Cursor::new(&include_bytes!("../../shaders/vert.spv")[..]);
+        let mut frag_spv_file = Cursor::new(&include_bytes!("../../shaders/frag.spv")[..]);
 
         let vertex_code =
             read_spv(&mut vertex_spv_file).expect("Failed to read vertex shader spv file");
@@ -381,7 +382,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             record_submit_commandbuffer(
                 &base.device,
                 base.draw_command_buffer,
-                base.draw_commands_reuse_fence,
+                base.submit_complete_fence,
                 base.present_queue,
                 &[vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT],
                 &[base.present_complete_semaphore],
