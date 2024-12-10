@@ -1,3 +1,5 @@
 {
-    "rust-analyzer.cargo.buildScripts.enable": true
+    "rust-analyzer.cargo.buildScripts.enable": true,
+    "editor.formatOnSave": true,
+    "files.trimTrailingWhitespace": true,
 }
