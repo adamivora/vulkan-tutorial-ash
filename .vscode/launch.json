@@ -1,0 +1,24 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "type": "lldb",
+            "request": "launch",
+            "name": "Debug executable 'tut'",
+            "cargo": {
+                "args": [
+                    "build",
+                    "--bin=tut",
+                    "--package=rust-vulkan"
+                ],
+                "filter": {
+                    "name": "tut",
+                    "kind": "bin"
+                }
+            },
+            "args": [],
+            "preLaunchTask": "installtool",
+            "cwd": "${workspaceFolder}"
+        }
+    ]
+}
