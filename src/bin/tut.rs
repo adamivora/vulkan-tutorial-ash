@@ -13,6 +13,7 @@ use winit::raw_window_handle::HasDisplayHandle;
 use winit::window::{Window, WindowId};
 
 use std::borrow::Cow;
+use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
 use std::process;
@@ -38,6 +39,16 @@ unsafe extern "system" fn messenger_debug_callback(
     };
     eprintln!("validation layer: {message}\n",);
     vk::FALSE
+}
+
+struct QueueFamilyIndices {
+    graphics_family: Option<u32>,
+}
+
+impl QueueFamilyIndices {
+    fn is_complete(&self) -> bool {
+        self.graphics_family.is_some()
+    }
 }
 
 struct Vulkan {
@@ -144,6 +155,49 @@ impl Vulkan {
         Result::Ok(instance)
     }
 
+    fn is_device_suitable(
+        instance: &Instance,
+        device: &ash::vk::PhysicalDevice,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let indices = Vulkan::find_queue_families(instance, device)?;
+        Result::Ok(indices.is_complete())
+    }
+
+    fn find_queue_families(
+        instance: &Instance,
+        device: &ash::vk::PhysicalDevice,
+    ) -> Result<QueueFamilyIndices, Box<dyn std::error::Error>> {
+        let queue_families =
+            unsafe { instance.get_physical_device_queue_family_properties(*device) };
+        let graphics_family = queue_families.iter().position(|queue_family| {
+            queue_family.queue_flags & ash::vk::QueueFlags::GRAPHICS
+                == ash::vk::QueueFlags::GRAPHICS
+        });
+
+        let graphics_family = if graphics_family.is_some() {
+            Some(u32::try_from(graphics_family.unwrap())?)
+        } else {
+            None
+        };
+
+        // Logic to find graphics queue family
+        Result::Ok(QueueFamilyIndices { graphics_family })
+    }
+
+    fn pick_physical_device(
+        instance: &Instance,
+    ) -> Result<ash::vk::PhysicalDevice, Box<dyn std::error::Error>> {
+        let devices = unsafe { instance.enumerate_physical_devices() }?;
+        let physical_device = devices
+            .iter()
+            .find(|&device| {
+                Vulkan::is_device_suitable(instance, device)
+                    .expect("failed to find a suitable GPU!")
+            })
+            .ok_or("failed to find a suitable GPU!")?;
+        Result::Ok(physical_device.clone())
+    }
+
     fn check_validation_layer_support() -> Result<bool, Box<dyn std::error::Error>> {
         let entry = Entry::linked();
         let available_layers: Vec<vk::LayerProperties> =
@@ -205,6 +259,7 @@ impl Vulkan {
         Box<dyn std::error::Error>,
     > {
         let instance = Vulkan::create_instance(window)?;
+        Vulkan::pick_physical_device(&instance)?;
         let (loader, callback) = Vulkan::setup_debug_messenger(&instance)?;
         Result::Ok((instance, loader, callback))
     }
