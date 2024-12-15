@@ -13,6 +13,7 @@ use std::borrow::Cow;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
+use std::fs;
 use std::os::raw::c_char;
 use std::{process, u32};
 
@@ -550,6 +551,48 @@ impl Vulkan {
             .collect()
     }
 
+    fn read_file(filename: &str) -> Result<std::fs::File, Box<dyn std::error::Error>> {
+        let data = fs::File::open(filename)?;
+        Result::Ok(data)
+    }
+
+    fn create_shader_module<R: std::io::Read + std::io::Seek>(
+        mut file: &mut R,
+        device: &ash::Device,
+    ) -> Result<vk::ShaderModule, Box<dyn std::error::Error>> {
+        let code = ash::util::read_spv(&mut file)?;
+        let create_info = vk::ShaderModuleCreateInfo::default().code(&code);
+
+        let shader_module = unsafe { device.create_shader_module(&create_info, None)? };
+        Result::Ok(shader_module)
+    }
+
+    fn create_graphics_pipeline(device: &ash::Device) -> Result<(), Box<dyn std::error::Error>> {
+        let mut vert_shader_code = Vulkan::read_file("./shaders/vert.spv")?;
+        let mut frag_shader_code = Vulkan::read_file("./shaders/frag.spv")?;
+
+        let vert_shader_module = Vulkan::create_shader_module(&mut vert_shader_code, device)?;
+        let frag_shader_module = Vulkan::create_shader_module(&mut frag_shader_code, device)?;
+
+        let p_name = unsafe { CStr::from_bytes_with_nul_unchecked(b"main\0") };
+        let vert_shader_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::VERTEX)
+            .module(vert_shader_module)
+            .name(p_name);
+        let frag_shader_stage_info = vk::PipelineShaderStageCreateInfo::default()
+            .stage(vk::ShaderStageFlags::FRAGMENT)
+            .module(frag_shader_module)
+            .name(p_name);
+        let _shader_stages = [vert_shader_stage_info, frag_shader_stage_info];
+
+        unsafe {
+            device.destroy_shader_module(vert_shader_module, None);
+            device.destroy_shader_module(frag_shader_module, None);
+        }
+
+        Result::Ok(())
+    }
+
     fn init_vulkan(window: &Window) -> Result<Vulkan, Box<dyn std::error::Error>> {
         let instance = Vulkan::create_instance(window)?;
         let (debug_utils_loader, debug_callback) = Vulkan::setup_debug_messenger(&instance)?;
@@ -572,6 +615,7 @@ impl Vulkan {
         )?;
         let swapchain_image_views =
             Vulkan::create_image_views(&device, &swapchain_images, swapchain_image_format)?;
+        Vulkan::create_graphics_pipeline(&device)?;
 
         Result::Ok(Self {
             instance,
