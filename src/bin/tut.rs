@@ -1,4 +1,4 @@
-use ash::vk;
+use ash::vk::{self, SurfaceFormatKHR, KHR_SWAPCHAIN_NAME};
 
 use ash::ext::debug_utils;
 use ash::Entry;
@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
-use std::process;
+use std::{process, u32};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -22,6 +22,8 @@ const HEIGHT: u32 = 600;
 const VALIDATION_LAYERS: [&CStr; 1] =
     [unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") }];
 const ENABLE_VALIDATION_LAYERS: bool = cfg!(debug_assertions);
+
+const DEVICE_EXTENSIONS: [&CStr; 1] = [KHR_SWAPCHAIN_NAME];
 
 unsafe extern "system" fn messenger_debug_callback(
     _message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -50,16 +52,94 @@ impl QueueFamilyIndices {
     }
 }
 
+struct SwapChainSupportDetails {
+    capabilities: vk::SurfaceCapabilitiesKHR,
+    formats: Vec<vk::SurfaceFormatKHR>,
+    present_modes: Vec<vk::PresentModeKHR>,
+}
+
+impl SwapChainSupportDetails {
+    fn query_swap_chain_support(
+        surface_instance: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+        device: vk::PhysicalDevice,
+    ) -> Result<SwapChainSupportDetails, vk::Result> {
+        let capabilities =
+            unsafe { surface_instance.get_physical_device_surface_capabilities(device, surface)? };
+        let formats =
+            unsafe { surface_instance.get_physical_device_surface_formats(device, surface)? };
+        let present_modes =
+            unsafe { surface_instance.get_physical_device_surface_present_modes(device, surface)? };
+
+        Result::Ok(SwapChainSupportDetails {
+            capabilities,
+            formats,
+            present_modes,
+        })
+    }
+
+    fn choose_swap_surface_format(
+        available_formats: &Vec<SurfaceFormatKHR>,
+    ) -> Result<vk::SurfaceFormatKHR, vk::Result> {
+        let format = available_formats
+            .iter()
+            .find(|&available_format| {
+                available_format.format == vk::Format::B8G8R8A8_SRGB
+                    && available_format.color_space == vk::ColorSpaceKHR::SRGB_NONLINEAR
+            })
+            .unwrap_or(available_formats.first().unwrap());
+        Result::Ok(*format)
+    }
+
+    fn choose_swap_present_mode(
+        available_present_modes: &Vec<vk::PresentModeKHR>,
+    ) -> vk::PresentModeKHR {
+        let present_mode = available_present_modes
+            .iter()
+            .find(|&&available_present_mode| available_present_mode == vk::PresentModeKHR::MAILBOX);
+        if present_mode.is_none() {
+            vk::PresentModeKHR::FIFO
+        } else {
+            *present_mode.unwrap()
+        }
+    }
+
+    fn choose_swap_extent(&self) -> vk::Extent2D {
+        match self.capabilities.current_extent.width {
+            u32::MAX => {
+                let actual_width = WIDTH.clamp(
+                    self.capabilities.min_image_extent.width,
+                    self.capabilities.max_image_extent.width,
+                );
+                let actual_height = HEIGHT.clamp(
+                    self.capabilities.min_image_extent.height,
+                    self.capabilities.max_image_extent.height,
+                );
+                vk::Extent2D {
+                    width: actual_width,
+                    height: actual_height,
+                }
+            }
+            _ => self.capabilities.current_extent,
+        }
+    }
+}
+
 struct Vulkan {
     instance: ash::Instance,
     debug_utils_loader: ash::ext::debug_utils::Instance,
     debug_callback: vk::DebugUtilsMessengerEXT,
     surface_instance: ash::khr::surface::Instance,
+    swapchain_device: ash::khr::swapchain::Device,
 
     device: ash::Device,
     surface: vk::SurfaceKHR,
     _present_queue: vk::Queue,
     _graphics_queue: vk::Queue,
+    swapchain: vk::SwapchainKHR,
+    _swapchain_images: Vec<vk::Image>,
+    _swapchain_image_format: vk::Format,
+    _swapchain_extent: vk::Extent2D,
 }
 
 #[derive(Default)]
@@ -155,14 +235,41 @@ impl Vulkan {
         Result::Ok(instance)
     }
 
+    fn check_device_extension_support(
+        instance: &ash::Instance,
+        device: ash::vk::PhysicalDevice,
+    ) -> Result<bool, vk::Result> {
+        let available_extensions =
+            unsafe { instance.enumerate_device_extension_properties(device)? };
+        let required_extensions = DEVICE_EXTENSIONS;
+
+        let mut required_extensions = HashSet::from(required_extensions);
+        available_extensions.iter().for_each(|extension| {
+            required_extensions.remove(extension.extension_name_as_c_str().unwrap());
+        });
+
+        Result::Ok(required_extensions.is_empty())
+    }
+
     fn is_device_suitable(
         instance: &ash::Instance,
         device: ash::vk::PhysicalDevice,
         surface_instance: &ash::khr::surface::Instance,
         surface: vk::SurfaceKHR,
-    ) -> Result<bool, Box<dyn std::error::Error>> {
+    ) -> Result<bool, vk::Result> {
         let indices = Vulkan::find_queue_families(instance, device, surface_instance, surface)?;
-        Result::Ok(indices.is_complete())
+        let extensions_supported = Vulkan::check_device_extension_support(instance, device)?;
+        let mut swapchain_adequate: bool = false;
+        if extensions_supported {
+            let swapchain_support = SwapChainSupportDetails::query_swap_chain_support(
+                surface_instance,
+                surface,
+                device,
+            )?;
+            swapchain_adequate = !swapchain_support.formats.is_empty()
+                && !swapchain_support.present_modes.is_empty();
+        }
+        Result::Ok(indices.is_complete() && extensions_supported && swapchain_adequate)
     }
 
     fn find_queue_families(
@@ -170,7 +277,7 @@ impl Vulkan {
         device: ash::vk::PhysicalDevice,
         surface_instance: &ash::khr::surface::Instance,
         surface: vk::SurfaceKHR,
-    ) -> Result<QueueFamilyIndices, Box<dyn std::error::Error>> {
+    ) -> Result<QueueFamilyIndices, vk::Result> {
         let queue_families =
             unsafe { instance.get_physical_device_queue_family_properties(device) };
 
@@ -179,7 +286,7 @@ impl Vulkan {
                 == ash::vk::QueueFlags::GRAPHICS
         });
         let graphics_family = if graphics_family.is_some() {
-            Some(u32::try_from(graphics_family.unwrap())?)
+            Some(u32::try_from(graphics_family.unwrap()).unwrap())
         } else {
             None
         };
@@ -221,7 +328,7 @@ impl Vulkan {
         Result::Ok(physical_device.clone())
     }
 
-    fn check_validation_layer_support() -> Result<bool, Box<dyn std::error::Error>> {
+    fn check_validation_layer_support() -> Result<bool, vk::Result> {
         let entry = Entry::linked();
         let available_layers: Vec<vk::LayerProperties> =
             unsafe { entry.enumerate_instance_layer_properties()? };
@@ -278,7 +385,7 @@ impl Vulkan {
         physical_device: vk::PhysicalDevice,
         surface_instance: &ash::khr::surface::Instance,
         surface: vk::SurfaceKHR,
-    ) -> Result<(ash::Device, vk::Queue, vk::Queue), Box<dyn std::error::Error>> {
+    ) -> Result<(ash::Device, vk::Queue, vk::Queue), vk::Result> {
         let indices =
             Vulkan::find_queue_families(instance, physical_device, surface_instance, surface)?;
 
@@ -301,7 +408,8 @@ impl Vulkan {
 
         let device_features = vk::PhysicalDeviceFeatures::default();
 
-        let mut extensions = Vec::new();
+        let mut extensions: Vec<*const i8> =
+            DEVICE_EXTENSIONS.iter().map(|&ext| ext.as_ptr()).collect();
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             extensions.push(ash::khr::portability_subset::NAME.as_ptr());
@@ -337,6 +445,78 @@ impl Vulkan {
         Result::Ok((surface_instance, surface))
     }
 
+    fn create_swapchain(
+        instance: &ash::Instance,
+        surface_instance: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+        device: vk::PhysicalDevice,
+        logical_device: &ash::Device,
+    ) -> Result<
+        (
+            ash::khr::swapchain::Device,
+            vk::SwapchainKHR,
+            Vec<vk::Image>,
+            vk::Format,
+            vk::Extent2D,
+        ),
+        vk::Result,
+    > {
+        let swapchain_support =
+            SwapChainSupportDetails::query_swap_chain_support(surface_instance, surface, device)?;
+        let surface_format =
+            SwapChainSupportDetails::choose_swap_surface_format(&swapchain_support.formats)?;
+        let present_mode =
+            SwapChainSupportDetails::choose_swap_present_mode(&swapchain_support.present_modes);
+        let extent = swapchain_support.choose_swap_extent();
+
+        let image_count: u32 = if swapchain_support.capabilities.max_image_count > 0
+            && swapchain_support.capabilities.min_image_count
+                >= swapchain_support.capabilities.max_image_count
+        {
+            swapchain_support.capabilities.max_image_count
+        } else {
+            swapchain_support.capabilities.min_image_count + 1
+        };
+
+        let mut create_info = vk::SwapchainCreateInfoKHR::default()
+            .surface(surface)
+            .min_image_count(image_count)
+            .image_format(surface_format.format)
+            .image_color_space(surface_format.color_space)
+            .image_extent(extent)
+            .image_array_layers(1)
+            .image_usage(vk::ImageUsageFlags::COLOR_ATTACHMENT)
+            .pre_transform(swapchain_support.capabilities.current_transform)
+            .composite_alpha(vk::CompositeAlphaFlagsKHR::OPAQUE)
+            .present_mode(present_mode)
+            .clipped(true);
+
+        let indices = Vulkan::find_queue_families(instance, device, surface_instance, surface)?;
+        let queue_family_indices = [
+            indices.graphics_family.unwrap(),
+            indices.present_family.unwrap(),
+        ];
+        if indices.graphics_family != indices.present_family {
+            create_info = create_info
+                .image_sharing_mode(vk::SharingMode::CONCURRENT)
+                .queue_family_indices(&queue_family_indices);
+        } else {
+            create_info = create_info.image_sharing_mode(vk::SharingMode::EXCLUSIVE)
+        }
+
+        let swapchain_device = ash::khr::swapchain::Device::new(&instance, &logical_device);
+        let swapchain = unsafe { swapchain_device.create_swapchain(&create_info, None)? };
+
+        let swapchain_images = unsafe { swapchain_device.get_swapchain_images(swapchain)? };
+        Result::Ok((
+            swapchain_device,
+            swapchain,
+            swapchain_images,
+            surface_format.format,
+            extent,
+        ))
+    }
+
     fn init_vulkan(window: &Window) -> Result<Vulkan, Box<dyn std::error::Error>> {
         let instance = Vulkan::create_instance(window)?;
         let (debug_utils_loader, debug_callback) = Vulkan::setup_debug_messenger(&instance)?;
@@ -344,6 +524,19 @@ impl Vulkan {
         let physical_device = Vulkan::pick_physical_device(&instance, &surface_instance, surface)?;
         let (device, graphics_queue, present_queue) =
             Vulkan::create_logical_device(&instance, physical_device, &surface_instance, surface)?;
+        let (
+            swapchain_device,
+            swapchain,
+            swapchain_images,
+            swapchain_image_format,
+            swapchain_extent,
+        ) = Vulkan::create_swapchain(
+            &instance,
+            &surface_instance,
+            surface,
+            physical_device,
+            &device,
+        )?;
 
         Result::Ok(Self {
             instance,
@@ -354,11 +547,18 @@ impl Vulkan {
             surface,
             _graphics_queue: graphics_queue,
             _present_queue: present_queue,
+            swapchain_device,
+            swapchain,
+            _swapchain_images: swapchain_images,
+            _swapchain_image_format: swapchain_image_format,
+            _swapchain_extent: swapchain_extent,
         })
     }
 
     fn cleanup(&mut self) {
         unsafe {
+            self.swapchain_device
+                .destroy_swapchain(self.swapchain, None);
             self.device.destroy_device(None);
             if ENABLE_VALIDATION_LAYERS {
                 self.debug_utils_loader
