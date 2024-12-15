@@ -146,6 +146,8 @@ struct Vulkan {
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
+    command_pool: vk::CommandPool,
+    command_buffer: vk::CommandBuffer,
 }
 
 #[derive(Default)]
@@ -730,6 +732,97 @@ impl Vulkan {
             .collect()
     }
 
+    fn create_command_pool(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+        surface_instance: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+    ) -> Result<vk::CommandPool, vk::Result> {
+        let queue_family_indices =
+            Vulkan::find_queue_families(instance, physical_device, surface_instance, surface)?;
+
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER)
+            .queue_family_index(queue_family_indices.graphics_family.unwrap());
+
+        let command_pool = unsafe { device.create_command_pool(&pool_info, None)? };
+        Result::Ok(command_pool)
+    }
+
+    fn create_command_buffer(
+        device: &ash::Device,
+        command_pool: vk::CommandPool,
+    ) -> Result<vk::CommandBuffer, vk::Result> {
+        let alloc_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(command_pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        let command_buffers = unsafe { device.allocate_command_buffers(&alloc_info)? };
+        Result::Ok(command_buffers[0])
+    }
+
+    fn record_command_buffer(
+        device: &ash::Device,
+        render_pass: vk::RenderPass,
+        swapchain_framebuffers: &Vec<vk::Framebuffer>,
+        swapchain_extent: vk::Extent2D,
+        graphics_pipeline: vk::Pipeline,
+        command_buffer: vk::CommandBuffer,
+        image_index: u32,
+    ) -> Result<(), vk::Result> {
+        let begin_info = vk::CommandBufferBeginInfo::default();
+        unsafe {
+            device.begin_command_buffer(command_buffer, &begin_info)?;
+        }
+
+        let clear_color_values = [vk::ClearValue {
+            color: vk::ClearColorValue {
+                float32: [0.0, 0.0, 0.0, 1.0],
+            },
+        }];
+        let render_pass_info = vk::RenderPassBeginInfo::default()
+            .render_pass(render_pass)
+            .framebuffer(*swapchain_framebuffers.get(image_index as usize).unwrap())
+            .render_area(vk::Rect2D::default().extent(swapchain_extent))
+            .clear_values(&clear_color_values);
+
+        unsafe {
+            device.cmd_begin_render_pass(
+                command_buffer,
+                &render_pass_info,
+                vk::SubpassContents::INLINE,
+            );
+            device.cmd_bind_pipeline(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                graphics_pipeline,
+            );
+        }
+
+        let viewport = vk::Viewport::default()
+            .width(swapchain_extent.width as f32)
+            .height(swapchain_extent.height as f32)
+            .min_depth(0.0)
+            .max_depth(1.0);
+        unsafe {
+            device.cmd_set_viewport(command_buffer, 0, &[viewport]);
+        }
+
+        let scissor = vk::Rect2D::default().extent(swapchain_extent);
+        unsafe {
+            device.cmd_set_scissor(command_buffer, 0, &[scissor]);
+        }
+
+        unsafe {
+            device.cmd_draw(command_buffer, 3, 1, 0, 0);
+            device.cmd_end_render_pass(command_buffer);
+            device.end_command_buffer(command_buffer)?;
+        }
+
+        Result::Ok(())
+    }
+
     fn init_vulkan(window: &Window) -> Result<Vulkan, Box<dyn std::error::Error>> {
         let instance = Vulkan::create_instance(window)?;
         let (debug_utils_loader, debug_callback) = Vulkan::setup_debug_messenger(&instance)?;
@@ -761,6 +854,14 @@ impl Vulkan {
             swapchain_extent,
             render_pass,
         )?;
+        let command_pool = Vulkan::create_command_pool(
+            &instance,
+            &device,
+            physical_device,
+            &surface_instance,
+            surface,
+        )?;
+        let command_buffer = Vulkan::create_command_buffer(&device, command_pool)?;
 
         Result::Ok(Self {
             instance,
@@ -781,11 +882,14 @@ impl Vulkan {
             render_pass,
             pipeline_layout,
             graphics_pipeline,
+            command_pool,
+            command_buffer,
         })
     }
 
     fn cleanup(&mut self) {
         unsafe {
+            self.device.destroy_command_pool(self.command_pool, None);
             self.swapchain_framebuffers.iter().for_each(|&framebuffer| {
                 self.device.destroy_framebuffer(framebuffer, None);
             });
