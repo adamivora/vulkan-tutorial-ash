@@ -140,6 +140,7 @@ struct Vulkan {
     _swapchain_images: Vec<vk::Image>,
     _swapchain_image_format: vk::Format,
     _swapchain_extent: vk::Extent2D,
+    swapchain_image_views: Vec<vk::ImageView>,
 }
 
 #[derive(Default)]
@@ -517,6 +518,38 @@ impl Vulkan {
         ))
     }
 
+    fn create_image_views(
+        device: &ash::Device,
+        swapchain_images: &Vec<vk::Image>,
+        swapchain_image_format: vk::Format,
+    ) -> Result<Vec<vk::ImageView>, vk::Result> {
+        swapchain_images
+            .iter()
+            .map(|&image| unsafe {
+                let create_info = vk::ImageViewCreateInfo::default()
+                    .image(image)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(swapchain_image_format)
+                    .components(
+                        vk::ComponentMapping::default()
+                            .r(vk::ComponentSwizzle::IDENTITY)
+                            .g(vk::ComponentSwizzle::IDENTITY)
+                            .b(vk::ComponentSwizzle::IDENTITY)
+                            .a(vk::ComponentSwizzle::IDENTITY),
+                    )
+                    .subresource_range(
+                        vk::ImageSubresourceRange::default()
+                            .aspect_mask(vk::ImageAspectFlags::COLOR)
+                            .base_mip_level(0)
+                            .level_count(1)
+                            .base_array_layer(0)
+                            .layer_count(1),
+                    );
+                device.create_image_view(&create_info, None)
+            })
+            .collect()
+    }
+
     fn init_vulkan(window: &Window) -> Result<Vulkan, Box<dyn std::error::Error>> {
         let instance = Vulkan::create_instance(window)?;
         let (debug_utils_loader, debug_callback) = Vulkan::setup_debug_messenger(&instance)?;
@@ -537,6 +570,8 @@ impl Vulkan {
             physical_device,
             &device,
         )?;
+        let swapchain_image_views =
+            Vulkan::create_image_views(&device, &swapchain_images, swapchain_image_format)?;
 
         Result::Ok(Self {
             instance,
@@ -552,11 +587,15 @@ impl Vulkan {
             _swapchain_images: swapchain_images,
             _swapchain_image_format: swapchain_image_format,
             _swapchain_extent: swapchain_extent,
+            swapchain_image_views,
         })
     }
 
     fn cleanup(&mut self) {
         unsafe {
+            self.swapchain_image_views.iter().for_each(|&image_view| {
+                self.device.destroy_image_view(image_view, None);
+            });
             self.swapchain_device
                 .destroy_swapchain(self.swapchain, None);
             self.device.destroy_device(None);
