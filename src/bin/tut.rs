@@ -144,6 +144,7 @@ struct Vulkan {
     swapchain_image_views: Vec<vk::ImageView>,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
+    graphics_pipeline: vk::Pipeline,
 }
 
 #[derive(Default)]
@@ -572,7 +573,8 @@ impl Vulkan {
     fn create_graphics_pipeline(
         device: &ash::Device,
         swapchain_extent: vk::Extent2D,
-    ) -> Result<vk::PipelineLayout, Box<dyn std::error::Error>> {
+        render_pass: vk::RenderPass,
+    ) -> Result<(vk::PipelineLayout, vk::Pipeline), Box<dyn std::error::Error>> {
         let mut vert_shader_code = Vulkan::read_file("./shaders/vert.spv")?;
         let mut frag_shader_code = Vulkan::read_file("./shaders/frag.spv")?;
 
@@ -594,7 +596,7 @@ impl Vulkan {
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
-            .primitive_restart_enable(true);
+            .primitive_restart_enable(false);
 
         let viewports = [vk::Viewport::default()
             .x(0.0)
@@ -645,12 +647,32 @@ impl Vulkan {
         let pipeline_layout =
             unsafe { device.create_pipeline_layout(&pipeline_layout_info, None)? };
 
+        let pipeline_info = vk::GraphicsPipelineCreateInfo::default()
+            .stages(&shader_stages)
+            .vertex_input_state(&vertex_input_info)
+            .input_assembly_state(&input_assembly)
+            .viewport_state(&viewport_state)
+            .rasterization_state(&rasterizer)
+            .multisample_state(&multisampling)
+            .color_blend_state(&color_blending)
+            .dynamic_state(&dynamic_state)
+            .layout(pipeline_layout)
+            .render_pass(render_pass)
+            .subpass(0);
+
+        let graphics_pipelines = unsafe {
+            device
+                .create_graphics_pipelines(vk::PipelineCache::null(), &[pipeline_info], None)
+                .expect("failed to create graphics pipeline!")
+        };
+        let graphics_pipeline = graphics_pipelines[0];
+
         unsafe {
             device.destroy_shader_module(vert_shader_module, None);
             device.destroy_shader_module(frag_shader_module, None);
         }
 
-        Result::Ok(pipeline_layout)
+        Result::Ok((pipeline_layout, graphics_pipeline))
     }
 
     fn create_render_pass(
@@ -707,7 +729,8 @@ impl Vulkan {
         let swapchain_image_views =
             Vulkan::create_image_views(&device, &swapchain_images, swapchain_image_format)?;
         let render_pass = Vulkan::create_render_pass(&device, swapchain_image_format)?;
-        let pipeline_layout = Vulkan::create_graphics_pipeline(&device, swapchain_extent)?;
+        let (pipeline_layout, graphics_pipeline) =
+            Vulkan::create_graphics_pipeline(&device, swapchain_extent, render_pass)?;
 
         Result::Ok(Self {
             instance,
@@ -726,11 +749,13 @@ impl Vulkan {
             swapchain_image_views,
             render_pass,
             pipeline_layout,
+            graphics_pipeline,
         })
     }
 
     fn cleanup(&mut self) {
         unsafe {
+            self.device.destroy_pipeline(self.graphics_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
             self.device.destroy_render_pass(self.render_pass, None);
