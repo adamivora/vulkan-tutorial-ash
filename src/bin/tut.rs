@@ -6,10 +6,11 @@ use winit::application::ApplicationHandler;
 use winit::error::EventLoopError;
 use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
-use winit::raw_window_handle::HasDisplayHandle;
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::{Window, WindowId};
 
 use std::borrow::Cow;
+use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_char;
@@ -40,19 +41,25 @@ unsafe extern "system" fn messenger_debug_callback(
 
 struct QueueFamilyIndices {
     graphics_family: Option<u32>,
+    present_family: Option<u32>,
 }
 
 impl QueueFamilyIndices {
     fn is_complete(&self) -> bool {
-        self.graphics_family.is_some()
+        self.graphics_family.is_some() && self.present_family.is_some()
     }
 }
 
 struct Vulkan {
     instance: ash::Instance,
-    device: ash::Device,
     debug_utils_loader: ash::ext::debug_utils::Instance,
     debug_callback: vk::DebugUtilsMessengerEXT,
+    surface_instance: ash::khr::surface::Instance,
+
+    device: ash::Device,
+    surface: vk::SurfaceKHR,
+    _present_queue: vk::Queue,
+    _graphics_queue: vk::Queue,
 }
 
 #[derive(Default)]
@@ -150,41 +157,64 @@ impl Vulkan {
 
     fn is_device_suitable(
         instance: &ash::Instance,
-        device: &ash::vk::PhysicalDevice,
+        device: ash::vk::PhysicalDevice,
+        surface_instance: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
     ) -> Result<bool, Box<dyn std::error::Error>> {
-        let indices = Vulkan::find_queue_families(instance, device)?;
+        let indices = Vulkan::find_queue_families(instance, device, surface_instance, surface)?;
         Result::Ok(indices.is_complete())
     }
 
     fn find_queue_families(
         instance: &ash::Instance,
-        device: &ash::vk::PhysicalDevice,
+        device: ash::vk::PhysicalDevice,
+        surface_instance: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
     ) -> Result<QueueFamilyIndices, Box<dyn std::error::Error>> {
         let queue_families =
-            unsafe { instance.get_physical_device_queue_family_properties(*device) };
+            unsafe { instance.get_physical_device_queue_family_properties(device) };
+
         let graphics_family = queue_families.iter().position(|queue_family| {
             queue_family.queue_flags & ash::vk::QueueFlags::GRAPHICS
                 == ash::vk::QueueFlags::GRAPHICS
         });
-
         let graphics_family = if graphics_family.is_some() {
             Some(u32::try_from(graphics_family.unwrap())?)
         } else {
             None
         };
 
+        let present_family = queue_families.iter().enumerate().find_map(
+            |(queue_family_index, _queue_family)| unsafe {
+                let idx = u32::try_from(queue_family_index).unwrap();
+                let supports_present = surface_instance
+                    .get_physical_device_surface_support(device, idx, surface)
+                    .unwrap();
+                if supports_present {
+                    Some(idx)
+                } else {
+                    None
+                }
+            },
+        );
+
         // Logic to find graphics queue family
-        Result::Ok(QueueFamilyIndices { graphics_family })
+        Result::Ok(QueueFamilyIndices {
+            graphics_family,
+            present_family,
+        })
     }
 
     fn pick_physical_device(
         instance: &ash::Instance,
+        surface_instance: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
     ) -> Result<ash::vk::PhysicalDevice, Box<dyn std::error::Error>> {
         let devices = unsafe { instance.enumerate_physical_devices() }?;
         let physical_device = devices
             .iter()
-            .find(|&device| {
-                Vulkan::is_device_suitable(instance, device)
+            .find(|&&device| {
+                Vulkan::is_device_suitable(instance, device, surface_instance, surface)
                     .expect("failed to find a suitable GPU!")
             })
             .ok_or("failed to find a suitable GPU!")?;
@@ -246,14 +276,28 @@ impl Vulkan {
     fn create_logical_device(
         instance: &ash::Instance,
         physical_device: vk::PhysicalDevice,
-    ) -> Result<ash::Device, Box<dyn std::error::Error>> {
-        let indices = Vulkan::find_queue_families(instance, &physical_device)?;
-        let queue_create_infos = [vk::DeviceQueueCreateInfo {
-            queue_family_index: indices.graphics_family.unwrap(),
-            queue_count: 1,
-            ..vk::DeviceQueueCreateInfo::default()
-        }
-        .queue_priorities(&[1.0])];
+        surface_instance: &ash::khr::surface::Instance,
+        surface: vk::SurfaceKHR,
+    ) -> Result<(ash::Device, vk::Queue, vk::Queue), Box<dyn std::error::Error>> {
+        let indices =
+            Vulkan::find_queue_families(instance, physical_device, surface_instance, surface)?;
+
+        let unique_queue_families = HashSet::from([
+            indices.graphics_family.unwrap(),
+            indices.present_family.unwrap(),
+        ]);
+
+        let queue_create_infos: Vec<vk::DeviceQueueCreateInfo> = unique_queue_families
+            .iter()
+            .map(|&queue_family| {
+                vk::DeviceQueueCreateInfo {
+                    queue_family_index: queue_family,
+                    queue_count: 1,
+                    ..vk::DeviceQueueCreateInfo::default()
+                }
+                .queue_priorities(&[1.0])
+            })
+            .collect();
 
         let device_features = vk::PhysicalDeviceFeatures::default();
 
@@ -269,20 +313,47 @@ impl Vulkan {
             .enabled_extension_names(&extensions);
 
         let device = unsafe { instance.create_device(physical_device, &create_info, None) }?;
-        Result::Ok(device)
+        let graphics_queue =
+            unsafe { device.get_device_queue(indices.graphics_family.unwrap(), 0) };
+        let present_queue = unsafe { device.get_device_queue(indices.present_family.unwrap(), 0) };
+        Result::Ok((device, graphics_queue, present_queue))
+    }
+
+    fn create_surface(
+        window: &Window,
+        instance: &ash::Instance,
+    ) -> Result<(ash::khr::surface::Instance, vk::SurfaceKHR), Box<dyn std::error::Error>> {
+        let entry = Entry::linked();
+        let surface = unsafe {
+            ash_window::create_surface(
+                &entry,
+                &instance,
+                window.display_handle()?.as_raw(),
+                window.window_handle()?.as_raw(),
+                None,
+            )
+        }?;
+        let surface_instance = ash::khr::surface::Instance::new(&entry, instance);
+        Result::Ok((surface_instance, surface))
     }
 
     fn init_vulkan(window: &Window) -> Result<Vulkan, Box<dyn std::error::Error>> {
         let instance = Vulkan::create_instance(window)?;
-        let physical_device = Vulkan::pick_physical_device(&instance)?;
-        let device = Vulkan::create_logical_device(&instance, physical_device)?;
-        let (loader, callback) = Vulkan::setup_debug_messenger(&instance)?;
+        let (debug_utils_loader, debug_callback) = Vulkan::setup_debug_messenger(&instance)?;
+        let (surface_instance, surface) = Vulkan::create_surface(window, &instance)?;
+        let physical_device = Vulkan::pick_physical_device(&instance, &surface_instance, surface)?;
+        let (device, graphics_queue, present_queue) =
+            Vulkan::create_logical_device(&instance, physical_device, &surface_instance, surface)?;
 
         Result::Ok(Self {
             instance,
             device,
-            debug_utils_loader: loader,
-            debug_callback: callback,
+            debug_utils_loader,
+            debug_callback,
+            surface_instance,
+            surface,
+            _graphics_queue: graphics_queue,
+            _present_queue: present_queue,
         })
     }
 
@@ -293,6 +364,7 @@ impl Vulkan {
                 self.debug_utils_loader
                     .destroy_debug_utils_messenger(self.debug_callback, None);
             }
+            self.surface_instance.destroy_surface(self.surface, None);
             self.instance.destroy_instance(None);
         }
     }
