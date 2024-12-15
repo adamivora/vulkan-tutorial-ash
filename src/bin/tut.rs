@@ -142,6 +142,7 @@ struct Vulkan {
     _swapchain_image_format: vk::Format,
     _swapchain_extent: vk::Extent2D,
     swapchain_image_views: Vec<vk::ImageView>,
+    render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
 }
 
@@ -652,6 +653,37 @@ impl Vulkan {
         Result::Ok(pipeline_layout)
     }
 
+    fn create_render_pass(
+        device: &ash::Device,
+        swapchain_image_format: vk::Format,
+    ) -> Result<vk::RenderPass, vk::Result> {
+        let color_attachments = [vk::AttachmentDescription::default()
+            .format(swapchain_image_format)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .load_op(vk::AttachmentLoadOp::CLEAR)
+            .store_op(vk::AttachmentStoreOp::STORE)
+            .stencil_load_op(vk::AttachmentLoadOp::DONT_CARE)
+            .stencil_store_op(vk::AttachmentStoreOp::DONT_CARE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .final_layout(vk::ImageLayout::PRESENT_SRC_KHR)];
+
+        let color_attachment_refs = [vk::AttachmentReference::default()
+            .attachment(0)
+            .layout(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)];
+
+        let subpasses = [vk::SubpassDescription::default()
+            .pipeline_bind_point(vk::PipelineBindPoint::GRAPHICS)
+            .color_attachments(&color_attachment_refs)];
+
+        let render_pass_info = vk::RenderPassCreateInfo::default()
+            .attachments(&color_attachments)
+            .subpasses(&subpasses);
+
+        let render_pass = unsafe { device.create_render_pass(&render_pass_info, None)? };
+
+        Result::Ok(render_pass)
+    }
+
     fn init_vulkan(window: &Window) -> Result<Vulkan, Box<dyn std::error::Error>> {
         let instance = Vulkan::create_instance(window)?;
         let (debug_utils_loader, debug_callback) = Vulkan::setup_debug_messenger(&instance)?;
@@ -674,6 +706,7 @@ impl Vulkan {
         )?;
         let swapchain_image_views =
             Vulkan::create_image_views(&device, &swapchain_images, swapchain_image_format)?;
+        let render_pass = Vulkan::create_render_pass(&device, swapchain_image_format)?;
         let pipeline_layout = Vulkan::create_graphics_pipeline(&device, swapchain_extent)?;
 
         Result::Ok(Self {
@@ -691,6 +724,7 @@ impl Vulkan {
             _swapchain_image_format: swapchain_image_format,
             _swapchain_extent: swapchain_extent,
             swapchain_image_views,
+            render_pass,
             pipeline_layout,
         })
     }
@@ -699,6 +733,7 @@ impl Vulkan {
         unsafe {
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
+            self.device.destroy_render_pass(self.render_pass, None);
             self.swapchain_image_views.iter().for_each(|&image_view| {
                 self.device.destroy_image_view(image_view, None);
             });
