@@ -142,6 +142,7 @@ struct Vulkan {
     _swapchain_image_format: vk::Format,
     _swapchain_extent: vk::Extent2D,
     swapchain_image_views: Vec<vk::ImageView>,
+    swapchain_framebuffers: Vec<vk::Framebuffer>,
     render_pass: vk::RenderPass,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
@@ -706,6 +707,29 @@ impl Vulkan {
         Result::Ok(render_pass)
     }
 
+    fn create_framebuffers(
+        device: &ash::Device,
+        swapchain_image_views: &Vec<vk::ImageView>,
+        swapchain_extent: vk::Extent2D,
+        render_pass: vk::RenderPass,
+    ) -> Result<Vec<vk::Framebuffer>, vk::Result> {
+        swapchain_image_views
+            .iter()
+            .map(|&view| {
+                let attachments = [view];
+
+                let framebuffer_info = vk::FramebufferCreateInfo::default()
+                    .render_pass(render_pass)
+                    .attachments(&attachments)
+                    .width(swapchain_extent.width)
+                    .height(swapchain_extent.height)
+                    .layers(1);
+
+                unsafe { device.create_framebuffer(&framebuffer_info, None) }
+            })
+            .collect()
+    }
+
     fn init_vulkan(window: &Window) -> Result<Vulkan, Box<dyn std::error::Error>> {
         let instance = Vulkan::create_instance(window)?;
         let (debug_utils_loader, debug_callback) = Vulkan::setup_debug_messenger(&instance)?;
@@ -731,6 +755,12 @@ impl Vulkan {
         let render_pass = Vulkan::create_render_pass(&device, swapchain_image_format)?;
         let (pipeline_layout, graphics_pipeline) =
             Vulkan::create_graphics_pipeline(&device, swapchain_extent, render_pass)?;
+        let swapchain_framebuffers = Vulkan::create_framebuffers(
+            &device,
+            &swapchain_image_views,
+            swapchain_extent,
+            render_pass,
+        )?;
 
         Result::Ok(Self {
             instance,
@@ -747,6 +777,7 @@ impl Vulkan {
             _swapchain_image_format: swapchain_image_format,
             _swapchain_extent: swapchain_extent,
             swapchain_image_views,
+            swapchain_framebuffers,
             render_pass,
             pipeline_layout,
             graphics_pipeline,
@@ -755,6 +786,9 @@ impl Vulkan {
 
     fn cleanup(&mut self) {
         unsafe {
+            self.swapchain_framebuffers.iter().for_each(|&framebuffer| {
+                self.device.destroy_framebuffer(framebuffer, None);
+            });
             self.device.destroy_pipeline(self.graphics_pipeline, None);
             self.device
                 .destroy_pipeline_layout(self.pipeline_layout, None);
