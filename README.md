@@ -1,4 +1,4 @@
-Vulkan tutorial reimplemented in Rust, with some extras and opinionated choice of packages. Development on arm64 macOS.
+Vulkan tutorial reimplemented in Rust, with some extras and an opinionated choice of underlying crates. Development on arm64 macOS.
 
 # Packages
 - [ash](https://github.com/ash-rs/ash)
