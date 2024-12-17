@@ -3,15 +3,21 @@ use rust_vulkan::ui::UiBuilder;
 use winit::error::EventLoopError;
 use winit::event_loop::{ControlFlow, EventLoop};
 
+use glam::Vec4;
 use rust_vulkan::app::App;
+use rust_vulkan::frame_data::FrameData;
 
 struct UiTut {
     value: usize,
+    color: Vec4,
 }
 
 impl Default for UiTut {
     fn default() -> Self {
-        Self { value: 0 }
+        Self {
+            value: 0,
+            color: Vec4::new(0.0, 0.0, 0.0, 0.0),
+        }
     }
 }
 
@@ -19,7 +25,8 @@ impl UiBuilder for UiTut {
     fn build(&mut self, ui: &mut imgui::Ui) {
         let choices = ["test test this is 1", "test test this is 2"];
         ui.window("Hello world")
-            .size([300.0, 110.0], Condition::FirstUseEver)
+            .always_auto_resize(true)
+            .size([300.0, 100.0], Condition::FirstUseEver)
             .build(|| {
                 ui.text_wrapped("Hello world!");
                 if ui.button(choices[self.value]) {
@@ -28,11 +35,22 @@ impl UiBuilder for UiTut {
 
                 ui.separator();
                 let mouse_pos = ui.io().mouse_pos;
-                ui.text(format!(
-                    "Mouse Position: ({:.1},{:.1})",
-                    mouse_pos[0], mouse_pos[1]
-                ));
+                if mouse_pos[0] != f32::MIN {
+                    ui.text(format!(
+                        "Mouse Position: ({:.1},{:.1})",
+                        mouse_pos[0], mouse_pos[1]
+                    ));
+                }
+
+                ui.separator();
+                ui.color_picker4("##picker", &mut self.color);
             });
+    }
+
+    fn frame_data(&self) -> FrameData {
+        return FrameData {
+            bgcolor: self.color,
+        };
     }
 }
 

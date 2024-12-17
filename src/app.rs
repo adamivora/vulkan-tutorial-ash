@@ -140,6 +140,7 @@ impl ApplicationHandler for App {
                             &context.window,
                             &mut context.imgui_renderer,
                             imgui_draw_data,
+                            &self.ui_builder.frame_data(),
                         )
                         .unwrap_or_else(|err| {
                             eprintln!("{err}");

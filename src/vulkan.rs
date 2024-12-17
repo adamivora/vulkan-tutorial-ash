@@ -8,6 +8,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
 
+use crate::frame_data::FrameData;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::convert::TryFrom;
@@ -819,6 +820,7 @@ impl Vulkan {
         image_index: u32,
         imgui_renderer: &mut Renderer,
         imgui_draw_data: &DrawData,
+        frame_data: &FrameData,
     ) -> Result<(), vk::Result> {
         let begin_info = vk::CommandBufferBeginInfo::default();
         let command_buffer = self.command_buffers[self.current_frame];
@@ -829,7 +831,7 @@ impl Vulkan {
 
         let clear_color_values = [vk::ClearValue {
             color: vk::ClearColorValue {
-                float32: [0.0, 0.0, 0.0, 1.0],
+                float32: frame_data.bgcolor.into(),
             },
         }];
         let render_pass_info = vk::RenderPassBeginInfo::default()
@@ -1032,6 +1034,7 @@ impl Vulkan {
         window: &Window,
         renderer: &mut Renderer,
         draw_data: &DrawData,
+        frame_data: &FrameData,
     ) -> Result<(), vk::Result> {
         if !self.is_rendering {
             return Result::Ok(());
@@ -1077,7 +1080,7 @@ impl Vulkan {
             image_index.unwrap()
         };
 
-        self.record_command_buffer(image_index, renderer, draw_data)?;
+        self.record_command_buffer(image_index, renderer, draw_data, frame_data)?;
 
         let wait_semaphores = [self.image_available_semaphores[self.current_frame]];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
