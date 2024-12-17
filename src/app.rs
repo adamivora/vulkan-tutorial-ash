@@ -9,7 +9,7 @@ use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
 use std::process;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 struct AppContext {
     imgui: imgui::Context,
@@ -59,7 +59,7 @@ impl AppContext {
 
 pub struct App {
     context: Option<AppContext>,
-    last_frame: std::time::Instant,
+    frame_start: std::time::Instant,
     ui_builder: Box<dyn UiBuilder>,
 }
 
@@ -67,7 +67,7 @@ impl App {
     pub fn new(ui_builder: impl UiBuilder + 'static) -> Self {
         Self {
             context: None,
-            last_frame: Instant::now(),
+            frame_start: Instant::now(),
             ui_builder: Box::new(ui_builder),
         }
     }
@@ -81,6 +81,36 @@ impl App {
             context
                 .platform
                 .handle_event(context.imgui.io_mut(), &context.window, &event);
+        }
+    }
+
+    fn render(&mut self) {
+        if let Some(context) = &mut self.context {
+            let ui = context.imgui.frame();
+            self.ui_builder.build(ui);
+            context.platform.prepare_render(ui, &context.window);
+            let imgui_draw_data = context.imgui.render();
+            context
+                .vulkan
+                .draw_frame(
+                    &context.window,
+                    &mut context.imgui_renderer,
+                    imgui_draw_data,
+                    &self.ui_builder.frame_data(),
+                )
+                .unwrap_or_else(|err| {
+                    eprintln!("{err}");
+                    process::exit(1);
+                });
+
+            let frame_data = self.ui_builder.frame_data();
+            if frame_data.frame_limiter {
+                let frame_time = Duration::from_secs_f32(1.0 / frame_data.frame_limiter_fps as f32);
+                let remaining_time = Instant::now() - self.frame_start + Duration::from_millis(1);
+                if frame_time > remaining_time {
+                    std::thread::sleep(frame_time - remaining_time);
+                }
+            }
         }
     }
 }
@@ -103,8 +133,8 @@ impl ApplicationHandler for App {
             context
                 .imgui
                 .io_mut()
-                .update_delta_time(now - self.last_frame);
-            self.last_frame = now;
+                .update_delta_time(now - self.frame_start);
+            self.frame_start = now;
         }
     }
 
@@ -129,24 +159,8 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
+                self.render();
                 if let Some(context) = &mut self.context {
-                    let ui = context.imgui.frame();
-                    self.ui_builder.build(ui);
-                    context.platform.prepare_render(ui, &context.window);
-                    let imgui_draw_data = context.imgui.render();
-                    context
-                        .vulkan
-                        .draw_frame(
-                            &context.window,
-                            &mut context.imgui_renderer,
-                            imgui_draw_data,
-                            &self.ui_builder.frame_data(),
-                        )
-                        .unwrap_or_else(|err| {
-                            eprintln!("{err}");
-                            process::exit(1);
-                        });
-
                     context.window.request_redraw();
                 }
             }

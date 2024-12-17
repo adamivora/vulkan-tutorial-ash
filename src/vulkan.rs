@@ -103,11 +103,13 @@ impl SwapChainSupportDetails {
         let present_mode = available_present_modes
             .iter()
             .find(|&&available_present_mode| available_present_mode == vk::PresentModeKHR::MAILBOX);
-        if present_mode.is_none() {
+        let present_mode = if present_mode.is_none() {
             vk::PresentModeKHR::FIFO
         } else {
             *present_mode.unwrap()
-        }
+        };
+        log::debug!("present mode: {:?}", present_mode);
+        present_mode
     }
 
     fn choose_swap_extent(&self, window: &Window) -> vk::Extent2D {
