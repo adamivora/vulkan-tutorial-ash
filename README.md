@@ -1,6 +1,7 @@
-Vulkan tutorial reimplemented in Rust, with some extras and an opinionated choice of underlying crates. Development on arm64 macOS.
 
-# Packages
+The [Vulkan tutorial](https://vulkan-tutorial.com/) reimplemented in Rust, with some extras and an opinionated choice of underlying crates. Development on arm64 macOS.
+
+## Crates
 - [ash](https://github.com/ash-rs/ash)
 - [winit](https://github.com/rust-windowing/winit)
 - [imgui](https://github.com/imgui-rs/)
