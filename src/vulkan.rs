@@ -1,7 +1,9 @@
 use ash::vk;
 
+#[cfg(debug_assertions)]
 use ash::ext::debug_utils;
 use ash::Entry;
+use imgui::DrawData;
 use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
@@ -12,7 +14,11 @@ use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::c_char;
+use std::sync::{Arc, Mutex};
 use std::u32;
+
+use imgui_rs_vulkan_renderer::Renderer;
+use vk_mem::{Allocator, AllocatorCreateInfo};
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
@@ -128,7 +134,9 @@ impl SwapChainSupportDetails {
 
 pub struct Vulkan {
     instance: ash::Instance,
+    #[cfg(debug_assertions)]
     debug_utils_loader: ash::ext::debug_utils::Instance,
+    #[cfg(debug_assertions)]
     debug_callback: vk::DebugUtilsMessengerEXT,
     surface_instance: ash::khr::surface::Instance,
     swapchain_device: ash::khr::swapchain::Device,
@@ -198,7 +206,10 @@ impl Vulkan {
             extensions.push(ash::khr::portability_enumeration::NAME.as_ptr());
             extensions.push(ash::khr::get_physical_device_properties2::NAME.as_ptr());
         }
-        extensions.push(ash::ext::debug_utils::NAME.as_ptr());
+        #[cfg(debug_assertions)]
+        {
+            extensions.push(ash::ext::debug_utils::NAME.as_ptr());
+        }
 
         let create_flags = if cfg!(any(target_os = "macos", target_os = "ios")) {
             vk::InstanceCreateFlags::ENUMERATE_PORTABILITY_KHR
@@ -371,6 +382,7 @@ impl Vulkan {
             .pfn_user_callback(Some(messenger_debug_callback))
     }
 
+    #[cfg(debug_assertions)]
     fn setup_debug_messenger(
         instance: &ash::Instance,
     ) -> Result<
@@ -481,7 +493,7 @@ impl Vulkan {
         let present_mode =
             SwapChainSupportDetails::choose_swap_present_mode(&swapchain_support.present_modes);
         let extent = swapchain_support.choose_swap_extent(window);
-        println!("New swapchain extent: {} {}", extent.width, extent.height);
+        log::debug!("New swapchain extent: {} {}", extent.width, extent.height);
 
         let image_count: u32 = if swapchain_support.capabilities.max_image_count > 0
             && swapchain_support.capabilities.min_image_count
@@ -802,11 +814,17 @@ impl Vulkan {
         ))
     }
 
-    fn record_command_buffer(&self, image_index: u32) -> Result<(), vk::Result> {
+    fn record_command_buffer(
+        &self,
+        image_index: u32,
+        imgui_renderer: &mut Renderer,
+        imgui_draw_data: &DrawData,
+    ) -> Result<(), vk::Result> {
         let begin_info = vk::CommandBufferBeginInfo::default();
+        let command_buffer = self.command_buffers[self.current_frame];
         unsafe {
             self.device
-                .begin_command_buffer(self.command_buffers[self.current_frame], &begin_info)?;
+                .begin_command_buffer(command_buffer, &begin_info)?;
         }
 
         let clear_color_values = [vk::ClearValue {
@@ -827,12 +845,12 @@ impl Vulkan {
 
         unsafe {
             self.device.cmd_begin_render_pass(
-                self.command_buffers[self.current_frame],
+                command_buffer,
                 &render_pass_info,
                 vk::SubpassContents::INLINE,
             );
             self.device.cmd_bind_pipeline(
-                self.command_buffers[self.current_frame],
+                command_buffer,
                 vk::PipelineBindPoint::GRAPHICS,
                 self.graphics_pipeline,
             );
@@ -844,30 +862,61 @@ impl Vulkan {
             .min_depth(0.0)
             .max_depth(1.0);
         unsafe {
-            self.device
-                .cmd_set_viewport(self.command_buffers[self.current_frame], 0, &[viewport]);
+            self.device.cmd_set_viewport(command_buffer, 0, &[viewport]);
         }
 
         let scissor = vk::Rect2D::default().extent(self.swapchain_extent);
         unsafe {
-            self.device
-                .cmd_set_scissor(self.command_buffers[self.current_frame], 0, &[scissor]);
+            self.device.cmd_set_scissor(command_buffer, 0, &[scissor]);
         }
 
         unsafe {
-            self.device
-                .cmd_draw(self.command_buffers[self.current_frame], 3, 1, 0, 0);
-            self.device
-                .cmd_end_render_pass(self.command_buffers[self.current_frame]);
-            self.device
-                .end_command_buffer(self.command_buffers[self.current_frame])?;
+            self.device.cmd_draw(command_buffer, 3, 1, 0, 0);
+        }
+
+        imgui_renderer
+            .cmd_draw(command_buffer, imgui_draw_data)
+            .unwrap();
+
+        unsafe {
+            self.device.cmd_end_render_pass(command_buffer);
+            self.device.end_command_buffer(command_buffer)?;
         }
 
         Result::Ok(())
     }
 
+    pub fn init_imgui_renderer(
+        &self,
+        imgui: &mut imgui::Context,
+    ) -> Result<Renderer, Box<dyn std::error::Error>> {
+        let imgui_renderer = {
+            let allocator = {
+                let allocator_create_info =
+                    AllocatorCreateInfo::new(&self.instance, &self.device, self.physical_device);
+
+                unsafe { Allocator::new(allocator_create_info)? }
+            };
+
+            Renderer::with_vk_mem_allocator(
+                Arc::new(Mutex::new(allocator)),
+                self.device.clone(),
+                self.graphics_queue,
+                self.command_pool,
+                self.render_pass,
+                imgui,
+                Some(imgui_rs_vulkan_renderer::Options {
+                    in_flight_frames: MAX_FRAMES_IN_FLIGHT as usize,
+                    ..Default::default()
+                }),
+            )?
+        };
+        Result::Ok(imgui_renderer)
+    }
+
     fn init_vulkan(window: &Window) -> Result<Vulkan, Box<dyn std::error::Error>> {
         let instance = Vulkan::create_instance(window)?;
+        #[cfg(debug_assertions)]
         let (debug_utils_loader, debug_callback) = Vulkan::setup_debug_messenger(&instance)?;
         let (surface_instance, surface) = Vulkan::create_surface(window, &instance)?;
         let physical_device = Vulkan::pick_physical_device(&instance, &surface_instance, surface)?;
@@ -913,7 +962,9 @@ impl Vulkan {
             instance,
             device,
             physical_device,
+            #[cfg(debug_assertions)]
             debug_utils_loader,
+            #[cfg(debug_assertions)]
             debug_callback,
             surface_instance,
             surface,
@@ -963,9 +1014,12 @@ impl Vulkan {
 
             self.device.destroy_device(None);
 
-            if ENABLE_VALIDATION_LAYERS {
-                self.debug_utils_loader
-                    .destroy_debug_utils_messenger(self.debug_callback, None);
+            #[cfg(debug_assertions)]
+            {
+                if ENABLE_VALIDATION_LAYERS {
+                    self.debug_utils_loader
+                        .destroy_debug_utils_messenger(self.debug_callback, None);
+                }
             }
 
             self.surface_instance.destroy_surface(self.surface, None);
@@ -973,7 +1027,12 @@ impl Vulkan {
         }
     }
 
-    pub fn draw_frame(&mut self, window: &Window) -> Result<(), vk::Result> {
+    pub fn draw_frame(
+        &mut self,
+        window: &Window,
+        renderer: &mut Renderer,
+        draw_data: &DrawData,
+    ) -> Result<(), vk::Result> {
         if !self.is_rendering {
             return Result::Ok(());
         }
@@ -1018,7 +1077,7 @@ impl Vulkan {
             image_index.unwrap()
         };
 
-        self.record_command_buffer(image_index)?;
+        self.record_command_buffer(image_index, renderer, draw_data)?;
 
         let wait_semaphores = [self.image_available_semaphores[self.current_frame]];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -1124,18 +1183,25 @@ impl Vulkan {
     }
 
     pub fn pause_rendering(&mut self) {
-        println!("Stopped rendering.");
+        log::info!("Stopped rendering.");
         self.is_rendering = false;
     }
 
     pub fn resume_rendering(&mut self) {
-        println!("Resumed rendering.");
+        log::info!("Resumed rendering.");
         self.is_rendering = true;
+    }
+
+    pub fn wait(&self) {
+        unsafe {
+            let _ = self.device.device_wait_idle();
+        }
     }
 }
 
 impl Drop for Vulkan {
     fn drop(&mut self) {
+        log::debug!("Destroying Vulkan...");
         unsafe {
             let _ = self.device.device_wait_idle();
         }
