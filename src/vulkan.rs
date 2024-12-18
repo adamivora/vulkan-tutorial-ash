@@ -1,29 +1,70 @@
-use ash::vk;
-
+use crate::frame_data::FrameData;
 #[cfg(debug_assertions)]
 use ash::ext::debug_utils;
+use ash::vk;
 use ash::Entry;
+use glam::{Vec2, Vec3};
 use imgui::DrawData;
-use winit::event_loop::ActiveEventLoop;
-use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
-use winit::window::Window;
-
-use crate::frame_data::FrameData;
+use imgui_rs_vulkan_renderer::Renderer;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::ffi::{CStr, CString};
 use std::fs;
+use std::mem::offset_of;
 use std::os::raw::c_char;
 use std::sync::{Arc, Mutex};
 use std::u32;
-
-use imgui_rs_vulkan_renderer::Renderer;
 use vk_mem::{Allocator, AllocatorCreateInfo};
+use winit::event_loop::ActiveEventLoop;
+use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use winit::window::Window;
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
 const MAX_FRAMES_IN_FLIGHT: u32 = 2;
+
+struct Vertex {
+    pos: Vec2,
+    color: Vec3,
+}
+
+impl Vertex {
+    const fn new(pos: Vec2, color: Vec3) -> Self {
+        Self { pos, color }
+    }
+
+    fn get_binding_description() -> vk::VertexInputBindingDescription {
+        let binding_description: vk::VertexInputBindingDescription =
+            vk::VertexInputBindingDescription::default()
+                .binding(0)
+                .stride(size_of::<Vertex>() as u32)
+                .input_rate(vk::VertexInputRate::VERTEX);
+        binding_description
+    }
+
+    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
+        let attribute_descriptions: [vk::VertexInputAttributeDescription; 2] = [
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(0)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(offset_of!(Vertex, pos) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(1)
+                .format(vk::Format::R32G32B32_SFLOAT)
+                .offset(offset_of!(Vertex, color) as u32),
+        ];
+        attribute_descriptions
+    }
+}
+
+const VERTICES: [Vertex; 3] = [
+    Vertex::new(Vec2::new(0.5, -0.5), Vec3::new(1.0, 0.0, 0.0)),
+    Vertex::new(Vec2::new(0.5, 0.5), Vec3::new(0.0, 1.0, 0.0)),
+    Vertex::new(Vec2::new(-0.5, 0.5), Vec3::new(0.0, 0.0, 1.0)),
+];
 
 const VALIDATION_LAYERS: [&CStr; 1] =
     [unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") }];
@@ -616,7 +657,12 @@ impl Vulkan {
             .name(p_name);
         let shader_stages = [vert_shader_stage_info, frag_shader_stage_info];
 
-        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default();
+        let binding_descriptions = [Vertex::get_binding_description()];
+        let attribute_descriptions = Vertex::get_attribute_descriptions();
+
+        let vertex_input_info = vk::PipelineVertexInputStateCreateInfo::default()
+            .vertex_binding_descriptions(&binding_descriptions)
+            .vertex_attribute_descriptions(&attribute_descriptions);
 
         let input_assembly = vk::PipelineInputAssemblyStateCreateInfo::default()
             .topology(vk::PrimitiveTopology::TRIANGLE_LIST)
