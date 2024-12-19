@@ -63,11 +63,14 @@ impl Vertex {
     }
 }
 
-const VERTICES: [Vertex; 3] = [
-    Vertex::new(Vec2::new(0.0, -0.5), Vec3::new(1.0, 0.0, 0.0)),
-    Vertex::new(Vec2::new(0.5, 0.5), Vec3::new(0.0, 1.0, 0.0)),
-    Vertex::new(Vec2::new(-0.5, 0.5), Vec3::new(0.0, 0.0, 1.0)),
+const VERTICES: [Vertex; 4] = [
+    Vertex::new(Vec2::new(-0.5, -0.5), Vec3::new(1.0, 0.0, 0.0)),
+    Vertex::new(Vec2::new(0.5, -0.5), Vec3::new(0.0, 1.0, 0.0)),
+    Vertex::new(Vec2::new(0.5, 0.5), Vec3::new(0.0, 0.0, 1.0)),
+    Vertex::new(Vec2::new(-0.5, 0.5), Vec3::new(1.0, 1.0, 1.0)),
 ];
+
+const INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
 
 const VALIDATION_LAYERS: [&CStr; 1] =
     [unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") }];
@@ -209,6 +212,8 @@ pub struct Vulkan {
     in_flight_fences: Vec<vk::Fence>,
     vertex_buffer: vk::Buffer,
     vertex_buffer_memory: vk::DeviceMemory,
+    index_buffer: vk::Buffer,
+    index_buffer_memory: vk::DeviceMemory,
     current_frame: usize,
     framebuffer_resized: bool,
     is_rendering: bool,
@@ -639,6 +644,8 @@ impl VulkanInit {
             is_rendering: true,
             vertex_buffer: vk::Buffer::null(),
             vertex_buffer_memory: vk::DeviceMemory::null(),
+            index_buffer: vk::Buffer::null(),
+            index_buffer_memory: vk::DeviceMemory::null(),
         };
 
         vulkan.create_image_views()?;
@@ -649,6 +656,7 @@ impl VulkanInit {
         vulkan.create_command_buffers()?;
         vulkan.create_sync_objects()?;
         vulkan.create_vertex_buffer()?;
+        vulkan.create_index_buffer()?;
 
         Result::Ok(vulkan)
     }
@@ -752,6 +760,12 @@ impl Vulkan {
         unsafe {
             self.device
                 .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
+            self.device.cmd_bind_index_buffer(
+                command_buffer,
+                self.index_buffer,
+                0,
+                vk::IndexType::UINT16,
+            );
         }
 
         let viewport = vk::Viewport::default()
@@ -770,7 +784,7 @@ impl Vulkan {
 
         unsafe {
             self.device
-                .cmd_draw(command_buffer, VERTICES.len() as u32, 1, 0, 0);
+                .cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
         }
 
         imgui_renderer
@@ -882,16 +896,18 @@ impl Vulkan {
     }
 
     fn copy_cpu_to_gpu<T: Copy>(
-        device: &ash::Device,
+        &self,
         device_memory: vk::DeviceMemory,
         from: &[T],
         size: vk::DeviceSize,
     ) -> VkResult<()> {
         unsafe {
-            let data = device.map_memory(device_memory, 0, size, vk::MemoryMapFlags::empty())?;
-            let mut index_slice = Align::new(data, align_of::<u32>() as u64, size);
+            let data =
+                self.device
+                    .map_memory(device_memory, 0, size, vk::MemoryMapFlags::empty())?;
+            let mut index_slice = Align::new(data, align_of::<T>() as u64, size);
             index_slice.copy_from_slice(from);
-            device.unmap_memory(device_memory);
+            self.device.unmap_memory(device_memory);
         }
 
         Result::Ok(())
@@ -1119,7 +1135,7 @@ impl Vulkan {
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
-        Self::copy_cpu_to_gpu(&self.device, staging_buffer_memory, &VERTICES, buffer_size)?;
+        self.copy_cpu_to_gpu(staging_buffer_memory, &VERTICES, buffer_size)?;
 
         let (vertex_buffer, vertex_buffer_memory) = self.create_buffer(
             buffer_size,
@@ -1135,6 +1151,33 @@ impl Vulkan {
 
         self.vertex_buffer = vertex_buffer;
         self.vertex_buffer_memory = vertex_buffer_memory;
+        Result::Ok(())
+    }
+
+    fn create_index_buffer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let buffer_size: u64 = size_of_val(&INDICES) as u64;
+        let (staging_buffer, staging_buffer_memory) = self.create_buffer(
+            buffer_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+
+        self.copy_cpu_to_gpu(staging_buffer_memory, &INDICES, buffer_size)?;
+
+        let (index_buffer, index_buffer_memory) = self.create_buffer(
+            buffer_size,
+            vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+        self.copy_buffer(staging_buffer, index_buffer, buffer_size)?;
+
+        unsafe {
+            self.device.destroy_buffer(staging_buffer, None);
+            self.device.free_memory(staging_buffer_memory, None);
+        }
+
+        self.index_buffer = index_buffer;
+        self.index_buffer_memory = index_buffer_memory;
         Result::Ok(())
     }
 
@@ -1172,6 +1215,9 @@ impl Vulkan {
     fn cleanup(&mut self) {
         unsafe {
             self.cleanup_swapchain();
+
+            self.device.destroy_buffer(self.index_buffer, None);
+            self.device.free_memory(self.index_buffer_memory, None);
 
             self.device.destroy_buffer(self.vertex_buffer, None);
             self.device.free_memory(self.vertex_buffer_memory, None);
