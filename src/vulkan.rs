@@ -5,17 +5,21 @@ use ash::prelude::VkResult;
 use ash::util::Align;
 use ash::vk;
 use ash::Entry;
-use glam::{Vec2, Vec3};
+use glam::{Mat4, Vec2, Vec3};
 use imgui::DrawData;
 use imgui_rs_vulkan_renderer::Renderer;
 use std::borrow::Cow;
 use std::collections::HashSet;
 use std::convert::TryFrom;
+use std::ffi::c_void;
 use std::ffi::{CStr, CString};
 use std::fs;
+use std::iter::zip;
 use std::mem::offset_of;
 use std::os::raw::c_char;
+use std::sync::LazyLock;
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use std::u32;
 use vk_mem::{Allocator, AllocatorCreateInfo};
 use winit::event_loop::ActiveEventLoop;
@@ -25,6 +29,8 @@ use winit::window::Window;
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
 const MAX_FRAMES_IN_FLIGHT: u32 = 2;
+
+const START_TIME: LazyLock<Instant> = LazyLock::new(|| Instant::now());
 
 #[derive(Copy, Clone)]
 struct Vertex {
@@ -61,6 +67,13 @@ impl Vertex {
         ];
         attribute_descriptions
     }
+}
+
+#[derive(Clone, Copy, Default)]
+struct UniformBufferObject {
+    model: Mat4,
+    view: Mat4,
+    proj: Mat4,
 }
 
 const VERTICES: [Vertex; 4] = [
@@ -203,6 +216,7 @@ pub struct Vulkan {
     swapchain_image_views: Vec<vk::ImageView>,
     swapchain_framebuffers: Vec<vk::Framebuffer>,
     render_pass: vk::RenderPass,
+    descriptor_set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     graphics_pipeline: vk::Pipeline,
     command_pool: vk::CommandPool,
@@ -214,6 +228,9 @@ pub struct Vulkan {
     vertex_buffer_memory: vk::DeviceMemory,
     index_buffer: vk::Buffer,
     index_buffer_memory: vk::DeviceMemory,
+    uniform_buffers: Vec<vk::Buffer>,
+    uniform_buffers_memory: Vec<vk::DeviceMemory>,
+    uniform_buffers_mapped: Vec<*mut c_void>,
     current_frame: usize,
     framebuffer_resized: bool,
     is_rendering: bool,
@@ -632,6 +649,7 @@ impl VulkanInit {
             swapchain_image_views: Vec::new(),
             swapchain_framebuffers: Vec::new(),
             render_pass: vk::RenderPass::null(),
+            descriptor_set_layout: vk::DescriptorSetLayout::null(),
             pipeline_layout: vk::PipelineLayout::null(),
             graphics_pipeline: vk::Pipeline::null(),
             command_pool: vk::CommandPool::null(),
@@ -646,10 +664,14 @@ impl VulkanInit {
             vertex_buffer_memory: vk::DeviceMemory::null(),
             index_buffer: vk::Buffer::null(),
             index_buffer_memory: vk::DeviceMemory::null(),
+            uniform_buffers: Vec::new(),
+            uniform_buffers_memory: Vec::new(),
+            uniform_buffers_mapped: Vec::new(),
         };
 
         vulkan.create_image_views()?;
         vulkan.create_render_pass()?;
+        vulkan.create_descriptor_set_layout()?;
         vulkan.create_graphics_pipeline()?;
         vulkan.create_framebuffers()?;
         vulkan.create_command_pool()?;
@@ -657,6 +679,7 @@ impl VulkanInit {
         vulkan.create_sync_objects()?;
         vulkan.create_vertex_buffer()?;
         vulkan.create_index_buffer()?;
+        vulkan.create_uniform_buffers()?;
 
         Result::Ok(vulkan)
     }
@@ -905,12 +928,16 @@ impl Vulkan {
             let data =
                 self.device
                     .map_memory(device_memory, 0, size, vk::MemoryMapFlags::empty())?;
-            let mut index_slice = Align::new(data, align_of::<T>() as u64, size);
-            index_slice.copy_from_slice(from);
+            Self::copy_to_ptr(data, from, size);
             self.device.unmap_memory(device_memory);
         }
 
         Result::Ok(())
+    }
+
+    unsafe fn copy_to_ptr<T: Copy>(to: *mut c_void, from: &[T], size: vk::DeviceSize) -> () {
+        let mut index_slice = Align::new(to, align_of::<T>() as u64, size);
+        index_slice.copy_from_slice(from);
     }
 
     fn create_image_views(&mut self) -> VkResult<()> {
@@ -940,6 +967,25 @@ impl Vulkan {
                 self.device.create_image_view(&create_info, None)
             })
             .collect::<VkResult<Vec<vk::ImageView>>>()?;
+        Result::Ok(())
+    }
+
+    fn create_descriptor_set_layout(&mut self) -> VkResult<()> {
+        let ubo_layout_bindings = [vk::DescriptorSetLayoutBinding::default()
+            .binding(0)
+            .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(1)
+            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+
+        let layout_info =
+            vk::DescriptorSetLayoutCreateInfo::default().bindings(&ubo_layout_bindings);
+
+        let descriptor_set_layout = unsafe {
+            self.device
+                .create_descriptor_set_layout(&layout_info, None)?
+        };
+        self.descriptor_set_layout = descriptor_set_layout;
+
         Result::Ok(())
     }
 
@@ -1016,7 +1062,9 @@ impl Vulkan {
             .logic_op_enable(false)
             .attachments(&color_blend_attachments);
 
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default();
+        let descriptor_set_layouts = [self.descriptor_set_layout];
+        let pipeline_layout_info =
+            vk::PipelineLayoutCreateInfo::default().set_layouts(&descriptor_set_layouts);
 
         let pipeline_layout = unsafe {
             self.device
@@ -1181,6 +1229,30 @@ impl Vulkan {
         Result::Ok(())
     }
 
+    fn create_uniform_buffers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let buffer_size = size_of::<UniformBufferObject>() as vk::DeviceSize;
+
+        for _i in 0..MAX_FRAMES_IN_FLIGHT {
+            let (uniform_buffer, uniform_buffer_memory) = self.create_buffer(
+                buffer_size,
+                vk::BufferUsageFlags::UNIFORM_BUFFER,
+                vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+            )?;
+            self.uniform_buffers.push(uniform_buffer);
+            self.uniform_buffers_memory.push(uniform_buffer_memory);
+            self.uniform_buffers_mapped.push(unsafe {
+                self.device.map_memory(
+                    uniform_buffer_memory,
+                    0,
+                    buffer_size,
+                    vk::MemoryMapFlags::empty(),
+                )?
+            });
+        }
+
+        Result::Ok(())
+    }
+
     fn create_command_buffers(&mut self) -> VkResult<()> {
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .command_pool(self.command_pool)
@@ -1215,6 +1287,16 @@ impl Vulkan {
     fn cleanup(&mut self) {
         unsafe {
             self.cleanup_swapchain();
+
+            zip(&self.uniform_buffers, &self.uniform_buffers_memory).for_each(
+                |(&uniform_buffer, &uniform_buffer_memory)| {
+                    self.device.destroy_buffer(uniform_buffer, None);
+                    self.device.free_memory(uniform_buffer_memory, None);
+                },
+            );
+
+            self.device
+                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
             self.device.destroy_buffer(self.index_buffer, None);
             self.device.free_memory(self.index_buffer_memory, None);
@@ -1254,6 +1336,30 @@ impl Vulkan {
         }
     }
 
+    fn update_uniform_buffer(&self, current_image: u32) {
+        let start_time = *START_TIME;
+        let current_time = Instant::now();
+        let time = current_time - start_time;
+
+        let ubo = UniformBufferObject {
+            model: Mat4::from_axis_angle(Vec3::Z, time.as_secs_f32() * (90.0_f32.to_radians())),
+            view: Mat4::look_at_lh(Vec3::splat(2.0), Vec3::ZERO, Vec3::Z),
+            proj: Mat4::perspective_lh(
+                45.0_f32.to_radians(),
+                self.swapchain_extent.width as f32 / self.swapchain_extent.height as f32,
+                0.1,
+                10.0,
+            ),
+        };
+
+        unsafe {
+            Self::copy_to_ptr(
+                self.uniform_buffers_mapped[current_image as usize],
+                &[ubo],
+                size_of::<UniformBufferObject>() as vk::DeviceSize,
+            );
+        }
+    }
     pub fn draw_frame(
         &mut self,
         window: &Window,
