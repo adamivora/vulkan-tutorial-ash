@@ -7,6 +7,7 @@ use ash::vk;
 use ash::vk::DescriptorType;
 use ash::Entry;
 use glam::{Mat4, Vec2, Vec3};
+use image::ImageReader;
 use imgui::DrawData;
 use imgui_rs_vulkan_renderer::Renderer;
 use std::borrow::Cow;
@@ -234,6 +235,8 @@ pub struct Vulkan {
     uniform_buffers_mapped: Vec<*mut c_void>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
+    texture_image: vk::Image,
+    texture_image_memory: vk::DeviceMemory,
     current_frame: usize,
     framebuffer_resized: bool,
     is_rendering: bool,
@@ -672,6 +675,8 @@ impl VulkanInit {
             uniform_buffers_mapped: Vec::new(),
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_sets: Vec::new(),
+            texture_image: vk::Image::null(),
+            texture_image_memory: vk::DeviceMemory::null(),
         };
 
         vulkan.create_image_views()?;
@@ -680,6 +685,7 @@ impl VulkanInit {
         vulkan.create_graphics_pipeline()?;
         vulkan.create_framebuffers()?;
         vulkan.create_command_pool()?;
+        vulkan.create_texture_image()?;
         vulkan.create_vertex_buffer()?;
         vulkan.create_index_buffer()?;
         vulkan.create_uniform_buffers()?;
@@ -893,12 +899,7 @@ impl Vulkan {
         Result::Ok((buffer, buffer_memory))
     }
 
-    fn copy_buffer(
-        &self,
-        src_buffer: vk::Buffer,
-        dst_buffer: vk::Buffer,
-        size: vk::DeviceSize,
-    ) -> VkResult<()> {
+    fn begin_single_time_commands(&self) -> VkResult<vk::CommandBuffer> {
         let alloc_info = vk::CommandBufferAllocateInfo::default()
             .level(vk::CommandBufferLevel::PRIMARY)
             .command_pool(self.command_pool)
@@ -911,16 +912,14 @@ impl Vulkan {
             .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
             self.device
-                .begin_command_buffer(command_buffer, &begin_info)?
+                .begin_command_buffer(command_buffer, &begin_info)?;
         }
 
-        let copy_regions = [vk::BufferCopy::default().size(size)];
-        unsafe {
-            self.device
-                .cmd_copy_buffer(command_buffer, src_buffer, dst_buffer, &copy_regions);
-            self.device.end_command_buffer(command_buffer)?;
-        }
+        Result::Ok(command_buffer)
+    }
 
+    fn end_single_time_commands(&self, command_buffer: vk::CommandBuffer) -> VkResult<()> {
+        let command_buffers = [command_buffer];
         let submit_infos = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
         unsafe {
             self.device
@@ -929,7 +928,25 @@ impl Vulkan {
             self.device
                 .free_command_buffers(self.command_pool, &command_buffers);
         }
+        Result::Ok(())
+    }
 
+    fn copy_buffer(
+        &self,
+        src_buffer: vk::Buffer,
+        dst_buffer: vk::Buffer,
+        size: vk::DeviceSize,
+    ) -> VkResult<()> {
+        let command_buffer = self.begin_single_time_commands()?;
+
+        let copy_regions = [vk::BufferCopy::default().size(size)];
+        unsafe {
+            self.device
+                .cmd_copy_buffer(command_buffer, src_buffer, dst_buffer, &copy_regions);
+            self.device.end_command_buffer(command_buffer)?;
+        }
+
+        self.end_single_time_commands(command_buffer)?;
         Result::Ok(())
     }
 
@@ -1190,6 +1207,192 @@ impl Vulkan {
         Result::Ok(())
     }
 
+    fn create_image(
+        &self,
+        width: u32,
+        height: u32,
+        format: vk::Format,
+        tiling: vk::ImageTiling,
+        usage: vk::ImageUsageFlags,
+        properties: vk::MemoryPropertyFlags,
+    ) -> Result<(vk::Image, vk::DeviceMemory), Box<dyn std::error::Error>> {
+        let image_info = vk::ImageCreateInfo::default()
+            .image_type(vk::ImageType::TYPE_2D)
+            .extent(vk::Extent3D {
+                width: width,
+                height: height,
+                depth: 1,
+            })
+            .mip_levels(1)
+            .array_layers(1)
+            .format(format)
+            .tiling(tiling)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .samples(vk::SampleCountFlags::TYPE_1);
+
+        let image = unsafe { self.device.create_image(&image_info, None)? };
+        let mem_requirements = unsafe { self.device.get_image_memory_requirements(image) };
+        let memory_type_index = self
+            .find_memory_type(mem_requirements.memory_type_bits, properties)
+            .ok_or("cannot find memory type")?;
+        let alloc_info = vk::MemoryAllocateInfo::default()
+            .allocation_size(mem_requirements.size)
+            .memory_type_index(memory_type_index);
+
+        let image_memory = unsafe { self.device.allocate_memory(&alloc_info, None)? };
+        unsafe {
+            self.device.bind_image_memory(image, image_memory, 0)?;
+        }
+        Result::Ok((image, image_memory))
+    }
+
+    fn transition_image_layout(
+        &self,
+        image: vk::Image,
+        old_layout: vk::ImageLayout,
+        new_layout: vk::ImageLayout,
+    ) -> VkResult<()> {
+        let command_buffer = self.begin_single_time_commands()?;
+
+        let (src_access_mask, dst_access_mask, source_stage, destination_stage) =
+            match (old_layout, new_layout) {
+                (vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL) => (
+                    vk::AccessFlags::empty(),
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::PipelineStageFlags::TOP_OF_PIPE,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                ),
+                (
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                ) => (
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::PipelineStageFlags::TRANSFER,
+                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                ),
+                _ => {
+                    panic!("unsupported layout transition!");
+                }
+            };
+
+        let barrier = vk::ImageMemoryBarrier::default()
+            .old_layout(old_layout)
+            .new_layout(new_layout)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                base_mip_level: 0,
+                level_count: 1,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .src_access_mask(src_access_mask)
+            .dst_access_mask(dst_access_mask);
+
+        unsafe {
+            self.device.cmd_pipeline_barrier(
+                command_buffer,
+                source_stage,
+                destination_stage,
+                vk::DependencyFlags::empty(),
+                &[],
+                &[],
+                &[barrier],
+            );
+        }
+
+        self.end_single_time_commands(command_buffer)?;
+        Result::Ok(())
+    }
+
+    fn copy_buffer_to_image(
+        &self,
+        buffer: vk::Buffer,
+        image: vk::Image,
+        width: u32,
+        height: u32,
+    ) -> VkResult<()> {
+        let command_buffer = self.begin_single_time_commands()?;
+
+        let region = vk::BufferImageCopy::default()
+            .buffer_offset(0)
+            .buffer_row_length(0)
+            .buffer_image_height(0)
+            .image_subresource(vk::ImageSubresourceLayers {
+                aspect_mask: vk::ImageAspectFlags::COLOR,
+                mip_level: 0,
+                base_array_layer: 0,
+                layer_count: 1,
+            })
+            .image_offset(vk::Offset3D::default())
+            .image_extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            });
+        unsafe {
+            self.device.cmd_copy_buffer_to_image(
+                command_buffer,
+                buffer,
+                image,
+                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                &[region],
+            );
+        }
+
+        self.end_single_time_commands(command_buffer)?;
+        Result::Ok(())
+    }
+
+    fn create_texture_image(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let img = ImageReader::open("textures/texture.jpg")?.decode()?;
+        let (tex_width, tex_height) = (img.width(), img.height());
+        let pixels = img.as_bytes();
+        let image_size = (tex_width as vk::DeviceSize) * (tex_height as vk::DeviceSize) * 4;
+
+        let (staging_buffer, staging_buffer_memory) = self.create_buffer(
+            image_size,
+            vk::BufferUsageFlags::TRANSFER_SRC,
+            vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
+        )?;
+        self.copy_cpu_to_gpu(staging_buffer_memory, pixels, image_size)?;
+
+        let (texture_image, texture_image_memory) = self.create_image(
+            tex_width,
+            tex_height,
+            vk::Format::R8G8B8A8_SRGB,
+            vk::ImageTiling::OPTIMAL,
+            vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED,
+            vk::MemoryPropertyFlags::DEVICE_LOCAL,
+        )?;
+
+        self.transition_image_layout(
+            texture_image,
+            vk::ImageLayout::UNDEFINED,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        )?;
+        self.copy_buffer_to_image(staging_buffer, texture_image, tex_width, tex_height)?;
+        self.transition_image_layout(
+            texture_image,
+            vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+            vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+        )?;
+
+        unsafe {
+            self.device.destroy_buffer(staging_buffer, None);
+            self.device.free_memory(staging_buffer_memory, None);
+        }
+
+        self.texture_image = texture_image;
+        self.texture_image_memory = texture_image_memory;
+        Result::Ok(())
+    }
+
     fn create_vertex_buffer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
         let buffer_size: u64 = size_of_val(&VERTICES) as u64;
         let (staging_buffer, staging_buffer_memory) = self.create_buffer(
@@ -1340,6 +1543,9 @@ impl Vulkan {
     fn cleanup(&mut self) {
         unsafe {
             self.cleanup_swapchain();
+
+            self.device.destroy_image(self.texture_image, None);
+            self.device.free_memory(self.texture_image_memory, None);
 
             zip(&self.uniform_buffers, &self.uniform_buffers_memory).for_each(
                 |(&uniform_buffer, &uniform_buffer_memory)| {
