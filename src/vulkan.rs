@@ -4,9 +4,9 @@ use ash::ext::debug_utils;
 use ash::prelude::VkResult;
 use ash::util::Align;
 use ash::vk;
-use ash::vk::DescriptorType;
 use ash::Entry;
 use glam::{Mat4, Vec2, Vec3};
+use image::EncodableLayout;
 use image::ImageReader;
 use imgui::DrawData;
 use imgui_rs_vulkan_renderer::Renderer;
@@ -38,11 +38,16 @@ static START_TIME: LazyLock<Instant> = LazyLock::new(|| Instant::now());
 struct Vertex {
     pos: Vec2,
     color: Vec3,
+    tex_coord: Vec2,
 }
 
 impl Vertex {
-    const fn new(pos: Vec2, color: Vec3) -> Self {
-        Self { pos, color }
+    const fn new(pos: Vec2, color: Vec3, tex_coord: Vec2) -> Self {
+        Self {
+            pos,
+            color,
+            tex_coord,
+        }
     }
 
     fn get_binding_description() -> vk::VertexInputBindingDescription {
@@ -54,8 +59,8 @@ impl Vertex {
         binding_description
     }
 
-    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 2] {
-        let attribute_descriptions: [vk::VertexInputAttributeDescription; 2] = [
+    fn get_attribute_descriptions() -> [vk::VertexInputAttributeDescription; 3] {
+        let attribute_descriptions: [vk::VertexInputAttributeDescription; 3] = [
             vk::VertexInputAttributeDescription::default()
                 .binding(0)
                 .location(0)
@@ -66,6 +71,11 @@ impl Vertex {
                 .location(1)
                 .format(vk::Format::R32G32B32_SFLOAT)
                 .offset(offset_of!(Vertex, color) as u32),
+            vk::VertexInputAttributeDescription::default()
+                .binding(0)
+                .location(2)
+                .format(vk::Format::R32G32_SFLOAT)
+                .offset(offset_of!(Vertex, tex_coord) as u32),
         ];
         attribute_descriptions
     }
@@ -80,10 +90,26 @@ struct UniformBufferObject {
 }
 
 const VERTICES: [Vertex; 4] = [
-    Vertex::new(Vec2::new(-0.5, 0.5), Vec3::new(1.0, 0.0, 0.0)),
-    Vertex::new(Vec2::new(0.5, 0.5), Vec3::new(0.0, 1.0, 0.0)),
-    Vertex::new(Vec2::new(0.5, -0.5), Vec3::new(0.0, 0.0, 1.0)),
-    Vertex::new(Vec2::new(-0.5, -0.5), Vec3::new(1.0, 1.0, 1.0)),
+    Vertex::new(
+        Vec2::new(-0.5, 0.5),
+        Vec3::new(1.0, 0.0, 0.0),
+        Vec2::new(1.0, 0.0),
+    ),
+    Vertex::new(
+        Vec2::new(0.5, 0.5),
+        Vec3::new(0.0, 1.0, 0.0),
+        Vec2::new(0.0, 0.0),
+    ),
+    Vertex::new(
+        Vec2::new(0.5, -0.5),
+        Vec3::new(0.0, 0.0, 1.0),
+        Vec2::new(0.0, 1.0),
+    ),
+    Vertex::new(
+        Vec2::new(-0.5, -0.5),
+        Vec3::new(1.0, 1.0, 1.0),
+        Vec2::new(1.0, 1.0),
+    ),
 ];
 
 const INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
@@ -996,20 +1022,23 @@ impl Vulkan {
     }
 
     fn create_descriptor_set_layout(&mut self) -> VkResult<()> {
-        let ubo_layout_bindings = [vk::DescriptorSetLayoutBinding::default()
+        let ubo_layout_binding = vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::VERTEX)];
+            .stage_flags(vk::ShaderStageFlags::VERTEX);
+        let sampler_layout_binding = vk::DescriptorSetLayoutBinding::default()
+            .binding(1)
+            .descriptor_count(1)
+            .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+            .stage_flags(vk::ShaderStageFlags::FRAGMENT);
+        let bindings = [ubo_layout_binding, sampler_layout_binding];
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
 
-        let layout_info =
-            vk::DescriptorSetLayoutCreateInfo::default().bindings(&ubo_layout_bindings);
-
-        let descriptor_set_layout = unsafe {
+        self.descriptor_set_layout = unsafe {
             self.device
                 .create_descriptor_set_layout(&layout_info, None)?
         };
-        self.descriptor_set_layout = descriptor_set_layout;
 
         Result::Ok(())
     }
@@ -1343,7 +1372,9 @@ impl Vulkan {
     }
 
     fn create_texture_image(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let img = ImageReader::open("textures/texture.jpg")?.decode()?;
+        let img = ImageReader::open("textures/texture.jpg")?
+            .decode()?
+            .into_rgba8();
         let (tex_width, tex_height) = (img.width(), img.height());
         let pixels = img.as_bytes();
         let image_size = (tex_width as vk::DeviceSize) * (tex_height as vk::DeviceSize) * 4;
@@ -1519,9 +1550,14 @@ impl Vulkan {
     }
 
     fn create_descriptor_pool(&mut self) -> VkResult<()> {
-        let pool_sizes = [vk::DescriptorPoolSize::default()
-            .ty(DescriptorType::UNIFORM_BUFFER)
-            .descriptor_count(MAX_FRAMES_IN_FLIGHT)];
+        let pool_sizes = [
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(MAX_FRAMES_IN_FLIGHT),
+            vk::DescriptorPoolSize::default()
+                .ty(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                .descriptor_count(MAX_FRAMES_IN_FLIGHT),
+        ];
         let pool_info = vk::DescriptorPoolCreateInfo::default()
             .pool_sizes(&pool_sizes)
             .max_sets(MAX_FRAMES_IN_FLIGHT);
@@ -1542,16 +1578,29 @@ impl Vulkan {
                 .buffer(self.uniform_buffers[i])
                 .offset(0)
                 .range(size_of::<UniformBufferObject>() as vk::DeviceSize)];
-            let descriptor_write = vk::WriteDescriptorSet::default()
-                .dst_set(self.descriptor_sets[i])
-                .dst_binding(0)
-                .dst_array_element(0)
-                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
-                .descriptor_count(1)
-                .buffer_info(&buffer_infos);
+            let image_infos = [vk::DescriptorImageInfo::default()
+                .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
+                .image_view(self.texture_image_view)
+                .sampler(self.texture_sampler)];
+            let descriptor_writes = [
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_sets[i])
+                    .dst_binding(0)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                    .descriptor_count(1)
+                    .buffer_info(&buffer_infos),
+                vk::WriteDescriptorSet::default()
+                    .dst_set(self.descriptor_sets[i])
+                    .dst_binding(1)
+                    .dst_array_element(0)
+                    .descriptor_type(vk::DescriptorType::COMBINED_IMAGE_SAMPLER)
+                    .descriptor_count(1)
+                    .image_info(&image_infos),
+            ];
             unsafe {
                 self.device
-                    .update_descriptor_sets(&[descriptor_write], &Vec::new());
+                    .update_descriptor_sets(&descriptor_writes, &Vec::new());
             }
         }
         Result::Ok(())
