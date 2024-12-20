@@ -72,6 +72,7 @@ impl Vertex {
 }
 
 #[derive(Clone, Copy, Default)]
+#[allow(dead_code)]
 struct UniformBufferObject {
     model: Mat4,
     view: Mat4,
@@ -237,6 +238,8 @@ pub struct Vulkan {
     descriptor_sets: Vec<vk::DescriptorSet>,
     texture_image: vk::Image,
     texture_image_memory: vk::DeviceMemory,
+    texture_image_view: vk::ImageView,
+    texture_sampler: vk::Sampler,
     current_frame: usize,
     framebuffer_resized: bool,
     is_rendering: bool,
@@ -361,7 +364,14 @@ impl VulkanInit {
             swapchain_adequate = !swapchain_support.formats.is_empty()
                 && !swapchain_support.present_modes.is_empty();
         }
-        Result::Ok(indices.is_complete() && extensions_supported && swapchain_adequate)
+
+        let supported_features = unsafe { instance.get_physical_device_features(device) };
+        Result::Ok(
+            indices.is_complete()
+                && extensions_supported
+                && swapchain_adequate
+                && supported_features.sampler_anisotropy != 0,
+        )
     }
 
     fn pick_physical_device(
@@ -459,7 +469,7 @@ impl VulkanInit {
             })
             .collect();
 
-        let device_features = vk::PhysicalDeviceFeatures::default();
+        let device_features = vk::PhysicalDeviceFeatures::default().sampler_anisotropy(true);
 
         let mut extensions: Vec<*const i8> =
             DEVICE_EXTENSIONS.iter().map(|&ext| ext.as_ptr()).collect();
@@ -677,6 +687,8 @@ impl VulkanInit {
             descriptor_sets: Vec::new(),
             texture_image: vk::Image::null(),
             texture_image_memory: vk::DeviceMemory::null(),
+            texture_image_view: vk::ImageView::null(),
+            texture_sampler: vk::Sampler::null(),
         };
 
         vulkan.create_image_views()?;
@@ -686,6 +698,8 @@ impl VulkanInit {
         vulkan.create_framebuffers()?;
         vulkan.create_command_pool()?;
         vulkan.create_texture_image()?;
+        vulkan.create_texture_image_view()?;
+        vulkan.create_texture_sampler()?;
         vulkan.create_vertex_buffer()?;
         vulkan.create_index_buffer()?;
         vulkan.create_uniform_buffers()?;
@@ -922,6 +936,7 @@ impl Vulkan {
         let command_buffers = [command_buffer];
         let submit_infos = [vk::SubmitInfo::default().command_buffers(&command_buffers)];
         unsafe {
+            self.device.end_command_buffer(command_buffer)?;
             self.device
                 .queue_submit(self.graphics_queue, &submit_infos, vk::Fence::null())?;
             self.device.queue_wait_idle(self.graphics_queue)?;
@@ -943,7 +958,6 @@ impl Vulkan {
         unsafe {
             self.device
                 .cmd_copy_buffer(command_buffer, src_buffer, dst_buffer, &copy_regions);
-            self.device.end_command_buffer(command_buffer)?;
         }
 
         self.end_single_time_commands(command_buffer)?;
@@ -976,28 +990,7 @@ impl Vulkan {
         self.swapchain_image_views = self
             .swapchain_images
             .iter()
-            .map(|&image| unsafe {
-                let create_info = vk::ImageViewCreateInfo::default()
-                    .image(image)
-                    .view_type(vk::ImageViewType::TYPE_2D)
-                    .format(self.swapchain_image_format)
-                    .components(
-                        vk::ComponentMapping::default()
-                            .r(vk::ComponentSwizzle::IDENTITY)
-                            .g(vk::ComponentSwizzle::IDENTITY)
-                            .b(vk::ComponentSwizzle::IDENTITY)
-                            .a(vk::ComponentSwizzle::IDENTITY),
-                    )
-                    .subresource_range(
-                        vk::ImageSubresourceRange::default()
-                            .aspect_mask(vk::ImageAspectFlags::COLOR)
-                            .base_mip_level(0)
-                            .level_count(1)
-                            .base_array_layer(0)
-                            .layer_count(1),
-                    );
-                self.device.create_image_view(&create_info, None)
-            })
+            .map(|&image| self.create_image_view(image, self.swapchain_image_format))
             .collect::<VkResult<Vec<vk::ImageView>>>()?;
         Result::Ok(())
     }
@@ -1262,7 +1255,7 @@ impl Vulkan {
                     vk::AccessFlags::empty(),
                     vk::AccessFlags::TRANSFER_WRITE,
                     vk::PipelineStageFlags::TOP_OF_PIPE,
-                    vk::PipelineStageFlags::FRAGMENT_SHADER,
+                    vk::PipelineStageFlags::TRANSFER,
                 ),
                 (
                     vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -1390,6 +1383,61 @@ impl Vulkan {
 
         self.texture_image = texture_image;
         self.texture_image_memory = texture_image_memory;
+        Result::Ok(())
+    }
+
+    fn create_image_view(&self, image: vk::Image, format: vk::Format) -> VkResult<vk::ImageView> {
+        let view_info = vk::ImageViewCreateInfo::default()
+            .image(image)
+            .view_type(vk::ImageViewType::TYPE_2D)
+            .format(format)
+            .subresource_range(
+                vk::ImageSubresourceRange::default()
+                    .aspect_mask(vk::ImageAspectFlags::COLOR)
+                    .base_mip_level(0)
+                    .level_count(1)
+                    .base_array_layer(0)
+                    .layer_count(1),
+            );
+
+        let image_view = unsafe { self.device.create_image_view(&view_info, None)? };
+        Result::Ok(image_view)
+    }
+
+    fn create_texture_image_view(&mut self) -> VkResult<()> {
+        self.texture_image_view =
+            self.create_image_view(self.texture_image, vk::Format::R8G8B8A8_SRGB)?;
+        Result::Ok(())
+    }
+
+    fn create_texture_sampler(&mut self) -> VkResult<()> {
+        let properties = unsafe {
+            self.instance
+                .get_physical_device_properties(self.physical_device)
+        };
+        log::debug!(
+            "max anisotropy: {}",
+            properties.limits.max_sampler_anisotropy
+        );
+
+        let sampler_info = vk::SamplerCreateInfo::default()
+            .mag_filter(vk::Filter::LINEAR)
+            .min_filter(vk::Filter::LINEAR)
+            .address_mode_u(vk::SamplerAddressMode::REPEAT)
+            .address_mode_v(vk::SamplerAddressMode::REPEAT)
+            .address_mode_w(vk::SamplerAddressMode::REPEAT)
+            .anisotropy_enable(true)
+            .max_anisotropy(properties.limits.max_sampler_anisotropy)
+            .border_color(vk::BorderColor::INT_OPAQUE_BLACK)
+            .unnormalized_coordinates(false)
+            .compare_enable(false)
+            .compare_op(vk::CompareOp::ALWAYS)
+            .mipmap_mode(vk::SamplerMipmapMode::LINEAR)
+            .mip_lod_bias(0.0)
+            .min_lod(0.0)
+            .max_lod(0.0);
+
+        self.texture_sampler = unsafe { self.device.create_sampler(&sampler_info, None)? };
         Result::Ok(())
     }
 
@@ -1544,6 +1592,10 @@ impl Vulkan {
         unsafe {
             self.cleanup_swapchain();
 
+            self.device.destroy_sampler(self.texture_sampler, None);
+            self.device
+                .destroy_image_view(self.texture_image_view, None);
+
             self.device.destroy_image(self.texture_image, None);
             self.device.free_memory(self.texture_image_memory, None);
 
@@ -1571,14 +1623,22 @@ impl Vulkan {
 
             self.device.destroy_render_pass(self.render_pass, None);
 
-            for i in 0..MAX_FRAMES_IN_FLIGHT {
-                self.device
-                    .destroy_semaphore(self.image_available_semaphores[i as usize], None);
-                self.device
-                    .destroy_semaphore(self.render_finished_semaphores[i as usize], None);
-                self.device
-                    .destroy_fence(self.in_flight_fences[i as usize], None);
-            }
+            zip(
+                zip(
+                    &self.image_available_semaphores,
+                    &self.render_finished_semaphores,
+                ),
+                &self.in_flight_fences,
+            )
+            .for_each(
+                |((&image_available_semaphore, &render_finished_semaphore), &in_flight_fence)| {
+                    self.device
+                        .destroy_semaphore(image_available_semaphore, None);
+                    self.device
+                        .destroy_semaphore(render_finished_semaphore, None);
+                    self.device.destroy_fence(in_flight_fence, None);
+                },
+            );
 
             self.device.destroy_command_pool(self.command_pool, None);
 

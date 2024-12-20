@@ -25,12 +25,11 @@ impl Default for UiTut {
 
 impl UiBuilder for UiTut {
     fn build(&mut self, ui: &mut imgui::Ui) {
-        ui.window("Hello world")
+        ui.window("Debug")
+            .position([0.0, 0.0], Condition::FirstUseEver)
             .always_auto_resize(true)
             .size([300.0, 100.0], Condition::FirstUseEver)
             .build(|| {
-                ui.text_wrapped("Hello world!");
-                ui.separator();
                 ui.checkbox("Frame Limiter", &mut self.frame_limiter);
                 if self.frame_limiter {
                     ui.same_line();
