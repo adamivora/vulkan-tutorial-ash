@@ -4,6 +4,7 @@ use ash::ext::debug_utils;
 use ash::prelude::VkResult;
 use ash::util::Align;
 use ash::vk;
+use ash::vk::DescriptorType;
 use ash::Entry;
 use glam::{Mat4, Vec2, Vec3};
 use imgui::DrawData;
@@ -30,7 +31,7 @@ const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
 const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 
-const START_TIME: LazyLock<Instant> = LazyLock::new(|| Instant::now());
+static START_TIME: LazyLock<Instant> = LazyLock::new(|| Instant::now());
 
 #[derive(Copy, Clone)]
 struct Vertex {
@@ -77,10 +78,10 @@ struct UniformBufferObject {
 }
 
 const VERTICES: [Vertex; 4] = [
-    Vertex::new(Vec2::new(-0.5, -0.5), Vec3::new(1.0, 0.0, 0.0)),
-    Vertex::new(Vec2::new(0.5, -0.5), Vec3::new(0.0, 1.0, 0.0)),
-    Vertex::new(Vec2::new(0.5, 0.5), Vec3::new(0.0, 0.0, 1.0)),
-    Vertex::new(Vec2::new(-0.5, 0.5), Vec3::new(1.0, 1.0, 1.0)),
+    Vertex::new(Vec2::new(-0.5, 0.5), Vec3::new(1.0, 0.0, 0.0)),
+    Vertex::new(Vec2::new(0.5, 0.5), Vec3::new(0.0, 1.0, 0.0)),
+    Vertex::new(Vec2::new(0.5, -0.5), Vec3::new(0.0, 0.0, 1.0)),
+    Vertex::new(Vec2::new(-0.5, -0.5), Vec3::new(1.0, 1.0, 1.0)),
 ];
 
 const INDICES: [u16; 6] = [0, 1, 2, 2, 3, 0];
@@ -231,6 +232,8 @@ pub struct Vulkan {
     uniform_buffers: Vec<vk::Buffer>,
     uniform_buffers_memory: Vec<vk::DeviceMemory>,
     uniform_buffers_mapped: Vec<*mut c_void>,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_sets: Vec<vk::DescriptorSet>,
     current_frame: usize,
     framebuffer_resized: bool,
     is_rendering: bool,
@@ -667,6 +670,8 @@ impl VulkanInit {
             uniform_buffers: Vec::new(),
             uniform_buffers_memory: Vec::new(),
             uniform_buffers_mapped: Vec::new(),
+            descriptor_pool: vk::DescriptorPool::null(),
+            descriptor_sets: Vec::new(),
         };
 
         vulkan.create_image_views()?;
@@ -675,11 +680,13 @@ impl VulkanInit {
         vulkan.create_graphics_pipeline()?;
         vulkan.create_framebuffers()?;
         vulkan.create_command_pool()?;
-        vulkan.create_command_buffers()?;
-        vulkan.create_sync_objects()?;
         vulkan.create_vertex_buffer()?;
         vulkan.create_index_buffer()?;
         vulkan.create_uniform_buffers()?;
+        vulkan.create_descriptor_pool()?;
+        vulkan.create_descriptor_sets()?;
+        vulkan.create_command_buffers()?;
+        vulkan.create_sync_objects()?;
 
         Result::Ok(vulkan)
     }
@@ -806,6 +813,14 @@ impl Vulkan {
         }
 
         unsafe {
+            self.device.cmd_bind_descriptor_sets(
+                command_buffer,
+                vk::PipelineBindPoint::GRAPHICS,
+                self.pipeline_layout,
+                0,
+                &[self.descriptor_sets[self.current_frame]],
+                &[],
+            );
             self.device
                 .cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
         }
@@ -1042,7 +1057,7 @@ impl Vulkan {
             .polygon_mode(vk::PolygonMode::FILL)
             .line_width(1.0)
             .cull_mode(vk::CullModeFlags::BACK)
-            .front_face(vk::FrontFace::CLOCKWISE)
+            .front_face(vk::FrontFace::COUNTER_CLOCKWISE)
             .depth_bias_enable(false);
 
         let multisampling = vk::PipelineMultisampleStateCreateInfo::default()
@@ -1249,7 +1264,45 @@ impl Vulkan {
                 )?
             });
         }
+        Result::Ok(())
+    }
 
+    fn create_descriptor_pool(&mut self) -> VkResult<()> {
+        let pool_sizes = [vk::DescriptorPoolSize::default()
+            .ty(DescriptorType::UNIFORM_BUFFER)
+            .descriptor_count(MAX_FRAMES_IN_FLIGHT)];
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
+            .pool_sizes(&pool_sizes)
+            .max_sets(MAX_FRAMES_IN_FLIGHT);
+
+        self.descriptor_pool = unsafe { self.device.create_descriptor_pool(&pool_info, None)? };
+        Result::Ok(())
+    }
+
+    fn create_descriptor_sets(&mut self) -> VkResult<()> {
+        let layouts = [self.descriptor_set_layout; MAX_FRAMES_IN_FLIGHT as usize];
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
+            .descriptor_pool(self.descriptor_pool)
+            .set_layouts(&layouts);
+
+        self.descriptor_sets = unsafe { self.device.allocate_descriptor_sets(&alloc_info)? };
+        for i in 0..MAX_FRAMES_IN_FLIGHT as usize {
+            let buffer_infos = [vk::DescriptorBufferInfo::default()
+                .buffer(self.uniform_buffers[i])
+                .offset(0)
+                .range(size_of::<UniformBufferObject>() as vk::DeviceSize)];
+            let descriptor_write = vk::WriteDescriptorSet::default()
+                .dst_set(self.descriptor_sets[i])
+                .dst_binding(0)
+                .dst_array_element(0)
+                .descriptor_type(vk::DescriptorType::UNIFORM_BUFFER)
+                .descriptor_count(1)
+                .buffer_info(&buffer_infos);
+            unsafe {
+                self.device
+                    .update_descriptor_sets(&[descriptor_write], &Vec::new());
+            }
+        }
         Result::Ok(())
     }
 
@@ -1295,6 +1348,8 @@ impl Vulkan {
                 },
             );
 
+            self.device
+                .destroy_descriptor_pool(self.descriptor_pool, None);
             self.device
                 .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
@@ -1343,8 +1398,8 @@ impl Vulkan {
 
         let ubo = UniformBufferObject {
             model: Mat4::from_axis_angle(Vec3::Z, time.as_secs_f32() * (90.0_f32.to_radians())),
-            view: Mat4::look_at_lh(Vec3::splat(2.0), Vec3::ZERO, Vec3::Z),
-            proj: Mat4::perspective_lh(
+            view: Mat4::look_at_rh(Vec3::splat(2.0), Vec3::ZERO, Vec3::Z),
+            proj: Mat4::perspective_rh(
                 45.0_f32.to_radians(),
                 self.swapchain_extent.width as f32 / self.swapchain_extent.height as f32,
                 0.1,
@@ -1399,6 +1454,8 @@ impl Vulkan {
             if image_index.is_none() {
                 return Result::Ok(());
             }
+
+            self.update_uniform_buffer(self.current_frame as u32);
 
             // Only reset the fence if we are submitting work
             self.device
