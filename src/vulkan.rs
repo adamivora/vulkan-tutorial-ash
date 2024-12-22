@@ -1,4 +1,5 @@
 use crate::frame_data::FrameData;
+use crate::obj_loader::ObjLoader;
 #[cfg(debug_assertions)]
 use ash::ext::debug_utils;
 use ash::prelude::VkResult;
@@ -9,13 +10,17 @@ use glam::{Mat4, Vec2, Vec3};
 use image::EncodableLayout;
 use image::ImageReader;
 use imgui::DrawData;
-use imgui_rs_vulkan_renderer::Renderer;
+use imgui_rs_vulkan_renderer::Renderer as ImguiRenderer;
+use serde::Serialize;
+use serde_binary::binary_stream::Endian;
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::convert::TryFrom;
 use std::ffi::c_void;
 use std::ffi::{CStr, CString};
 use std::fs;
+use std::hash::Hash;
 use std::iter::zip;
 use std::mem::offset_of;
 use std::os::raw::c_char;
@@ -30,26 +35,28 @@ use winit::window::Window;
 
 const WIDTH: u32 = 800;
 const HEIGHT: u32 = 600;
+const MODEL_PATH: &str = "models/viking_room.obj";
+const TEXTURE_PATH: &str = "textures/viking_room.png";
 const MAX_FRAMES_IN_FLIGHT: u32 = 2;
 
 static START_TIME: LazyLock<Instant> = LazyLock::new(|| Instant::now());
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, PartialEq, Serialize)]
 struct Vertex {
     pos: Vec3,
     color: Vec3,
     tex_coord: Vec2,
 }
 
-impl Vertex {
-    const fn new(pos: Vec3, color: Vec3, tex_coord: Vec2) -> Self {
-        Self {
-            pos,
-            color,
-            tex_coord,
-        }
-    }
+impl Eq for Vertex {}
 
+impl Hash for Vertex {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write(&serde_binary::to_vec(&self, Endian::default()).unwrap());
+    }
+}
+
+impl Vertex {
     fn get_binding_description() -> vk::VertexInputBindingDescription {
         let binding_description: vk::VertexInputBindingDescription =
             vk::VertexInputBindingDescription::default()
@@ -89,56 +96,11 @@ struct UniformBufferObject {
     proj: Mat4,
 }
 
-const VERTICES: [Vertex; 8] = [
-    Vertex::new(
-        Vec3::new(-0.5, 0.5, 0.0),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec2::new(0.0, 0.0),
-    ),
-    Vertex::new(
-        Vec3::new(0.5, 0.5, 0.0),
-        Vec3::new(0.0, 1.0, 0.0),
-        Vec2::new(1.0, 0.0),
-    ),
-    Vertex::new(
-        Vec3::new(0.5, -0.5, 0.0),
-        Vec3::new(0.0, 0.0, 1.0),
-        Vec2::new(1.0, 1.0),
-    ),
-    Vertex::new(
-        Vec3::new(-0.5, -0.5, 0.0),
-        Vec3::new(1.0, 1.0, 1.0),
-        Vec2::new(0.0, 1.0),
-    ),
-    Vertex::new(
-        Vec3::new(-0.5, 0.5, -0.5),
-        Vec3::new(1.0, 0.0, 0.0),
-        Vec2::new(0.0, 0.0),
-    ),
-    Vertex::new(
-        Vec3::new(0.5, 0.5, -0.5),
-        Vec3::new(0.0, 1.0, 0.0),
-        Vec2::new(1.0, 0.0),
-    ),
-    Vertex::new(
-        Vec3::new(0.5, -0.5, -0.5),
-        Vec3::new(0.0, 0.0, 1.0),
-        Vec2::new(1.0, 1.0),
-    ),
-    Vertex::new(
-        Vec3::new(-0.5, -0.5, -0.5),
-        Vec3::new(1.0, 1.0, 1.0),
-        Vec2::new(0.0, 1.0),
-    ),
-];
-
-const INDICES: [u16; 12] = [0, 1, 2, 2, 3, 0, 4, 5, 6, 6, 7, 4];
-
 const VALIDATION_LAYERS: [&CStr; 1] =
     [unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") }];
 const ENABLE_VALIDATION_LAYERS: bool = cfg!(debug_assertions);
 
-const DEVICE_EXTENSIONS: [&CStr; 1] = [vk::KHR_SWAPCHAIN_NAME];
+const DEVICE_EXTENSIONS: [&CStr; 2] = [vk::KHR_SWAPCHAIN_NAME, vk::KHR_MAINTENANCE1_NAME];
 
 unsafe extern "system" fn messenger_debug_callback(
     _message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -289,6 +251,10 @@ pub struct Vulkan {
     depth_image: vk::Image,
     depth_image_memory: vk::DeviceMemory,
     depth_image_view: vk::ImageView,
+
+    vertices: Vec<Vertex>,
+    indices: Vec<u32>,
+
     current_frame: usize,
     framebuffer_resized: bool,
     is_rendering: bool,
@@ -741,6 +707,8 @@ impl VulkanInit {
             depth_image: vk::Image::null(),
             depth_image_memory: vk::DeviceMemory::null(),
             depth_image_view: vk::ImageView::null(),
+            vertices: Vec::new(),
+            indices: Vec::new(),
         };
 
         vulkan.create_image_views()?;
@@ -753,6 +721,7 @@ impl VulkanInit {
         vulkan.create_texture_image()?;
         vulkan.create_texture_image_view()?;
         vulkan.create_texture_sampler()?;
+        vulkan.load_model()?;
         vulkan.create_vertex_buffer()?;
         vulkan.create_index_buffer()?;
         vulkan.create_uniform_buffers()?;
@@ -818,7 +787,7 @@ impl Vulkan {
     fn record_command_buffer(
         &self,
         image_index: u32,
-        imgui_renderer: &mut Renderer,
+        imgui_renderer: &mut ImguiRenderer,
         imgui_draw_data: &DrawData,
         frame_data: &FrameData,
     ) -> VkResult<()> {
@@ -875,13 +844,14 @@ impl Vulkan {
                 command_buffer,
                 self.index_buffer,
                 0,
-                vk::IndexType::UINT16,
+                vk::IndexType::UINT32,
             );
         }
 
         let viewport = vk::Viewport::default()
+            .y(self.swapchain_extent.height as f32)
             .width(self.swapchain_extent.width as f32)
-            .height(self.swapchain_extent.height as f32)
+            .height(-1.0 * self.swapchain_extent.height as f32)
             .min_depth(0.0)
             .max_depth(1.0);
         unsafe {
@@ -903,7 +873,7 @@ impl Vulkan {
                 &[],
             );
             self.device
-                .cmd_draw_indexed(command_buffer, INDICES.len() as u32, 1, 0, 0, 0);
+                .cmd_draw_indexed(command_buffer, self.indices.len() as u32, 1, 0, 0, 0);
         }
 
         imgui_renderer
@@ -921,7 +891,7 @@ impl Vulkan {
     pub fn init_imgui_renderer(
         &self,
         imgui: &mut imgui::Context,
-    ) -> Result<Renderer, Box<dyn std::error::Error>> {
+    ) -> Result<ImguiRenderer, Box<dyn std::error::Error>> {
         let imgui_renderer = {
             let allocator = {
                 let allocator_create_info =
@@ -930,7 +900,7 @@ impl Vulkan {
                 unsafe { Allocator::new(allocator_create_info)? }
             };
 
-            Renderer::with_vk_mem_allocator(
+            ImguiRenderer::with_vk_mem_allocator(
                 Arc::new(Mutex::new(allocator)),
                 self.device.clone(),
                 self.graphics_queue,
@@ -1539,9 +1509,7 @@ impl Vulkan {
     }
 
     fn create_texture_image(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let img = ImageReader::open("textures/texture.jpg")?
-            .decode()?
-            .into_rgba8();
+        let img = ImageReader::open(TEXTURE_PATH)?.decode()?.into_rgba8();
         let (tex_width, tex_height) = (img.width(), img.height());
         let pixels = img.as_bytes();
         let image_size = (tex_width as vk::DeviceSize) * (tex_height as vk::DeviceSize) * 4;
@@ -1650,14 +1618,14 @@ impl Vulkan {
     }
 
     fn create_vertex_buffer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let buffer_size: u64 = size_of_val(&VERTICES) as u64;
+        let buffer_size: u64 = size_of::<Vertex>() as u64 * self.vertices.len() as u64;
         let (staging_buffer, staging_buffer_memory) = self.create_buffer(
             buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
-        self.copy_cpu_to_gpu(staging_buffer_memory, &VERTICES, buffer_size)?;
+        self.copy_cpu_to_gpu(staging_buffer_memory, &self.vertices, buffer_size)?;
 
         let (vertex_buffer, vertex_buffer_memory) = self.create_buffer(
             buffer_size,
@@ -1677,14 +1645,14 @@ impl Vulkan {
     }
 
     fn create_index_buffer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let buffer_size: u64 = size_of_val(&INDICES) as u64;
+        let buffer_size: u64 = size_of::<u32>() as u64 * self.indices.len() as u64;
         let (staging_buffer, staging_buffer_memory) = self.create_buffer(
             buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
-        self.copy_cpu_to_gpu(staging_buffer_memory, &INDICES, buffer_size)?;
+        self.copy_cpu_to_gpu(staging_buffer_memory, &self.indices, buffer_size)?;
 
         let (index_buffer, index_buffer_memory) = self.create_buffer(
             buffer_size,
@@ -1814,6 +1782,41 @@ impl Vulkan {
         Result::Ok(())
     }
 
+    fn load_model(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+        let mesh = ObjLoader::load(MODEL_PATH)?;
+        let vertices = &mesh.vertices;
+        let texcoords = &mesh.tex_coords;
+        let mut unique_vertices = HashMap::new();
+        mesh.indices.iter().for_each(|index| {
+            let vertex = Vertex {
+                pos: Vec3::from_slice(
+                    &vertices[3 * index.vertex_index..3 * (index.vertex_index + 1)],
+                ),
+                tex_coord: if index.texcoord_index == usize::MAX {
+                    Vec2::ZERO
+                } else {
+                    Vec2 {
+                        x: texcoords[2 * index.texcoord_index + 0],
+                        y: 1.0 - texcoords[2 * index.texcoord_index + 1],
+                    }
+                },
+                color: Vec3::ONE,
+            };
+            if !unique_vertices.contains_key(&vertex) {
+                unique_vertices.insert(vertex, self.vertices.len());
+                self.vertices.push(vertex);
+            }
+
+            self.indices.push(unique_vertices[&vertex] as u32);
+        });
+        log::info!(
+            "Loaded {} vertices, {} indices.",
+            self.vertices.len(),
+            self.indices.len()
+        );
+        Result::Ok(())
+    }
+
     fn cleanup(&mut self) {
         unsafe {
             self.cleanup_swapchain();
@@ -1890,7 +1893,7 @@ impl Vulkan {
 
         let ubo = UniformBufferObject {
             model: Mat4::from_axis_angle(Vec3::Z, time.as_secs_f32() * (90.0_f32.to_radians())),
-            view: Mat4::look_at_rh(Vec3::splat(2.0), Vec3::ZERO, Vec3::NEG_Z),
+            view: Mat4::look_at_rh(Vec3::splat(2.0), Vec3::ZERO, Vec3::Z),
             proj: Mat4::perspective_rh(
                 45.0_f32.to_radians(),
                 self.swapchain_extent.width as f32 / self.swapchain_extent.height as f32,
@@ -1910,7 +1913,7 @@ impl Vulkan {
     pub fn draw_frame(
         &mut self,
         window: &Window,
-        renderer: &mut Renderer,
+        renderer: &mut ImguiRenderer,
         draw_data: &DrawData,
         frame_data: &FrameData,
     ) -> Result<(), vk::Result> {
