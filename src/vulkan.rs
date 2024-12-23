@@ -1886,19 +1886,24 @@ impl Vulkan {
         }
     }
 
-    fn update_uniform_buffer(&self, current_image: u32) {
+    fn update_uniform_buffer(&self, current_image: u32, frame_data: &FrameData) {
         let start_time = *START_TIME;
         let current_time = Instant::now();
         let time = current_time - start_time;
 
+        let model = if frame_data.rotate_model {
+            Mat4::from_axis_angle(Vec3::Z, time.as_secs_f32() * (90.0_f32.to_radians()))
+        } else {
+            Mat4::from_axis_angle(Vec3::Z, 0.0)
+        };
         let ubo = UniformBufferObject {
-            model: Mat4::from_axis_angle(Vec3::Z, time.as_secs_f32() * (90.0_f32.to_radians())),
-            view: Mat4::look_at_rh(Vec3::splat(2.0), Vec3::ZERO, Vec3::Z),
+            model,
+            view: Mat4::look_at_rh(frame_data.cam_eye, frame_data.cam_center, frame_data.cam_up),
             proj: Mat4::perspective_rh(
                 45.0_f32.to_radians(),
                 self.swapchain_extent.width as f32 / self.swapchain_extent.height as f32,
-                0.1,
-                10.0,
+                frame_data.cam_nearfar.x,
+                frame_data.cam_nearfar.y,
             ),
         };
 
@@ -1950,7 +1955,7 @@ impl Vulkan {
                 return Result::Ok(());
             }
 
-            self.update_uniform_buffer(self.current_frame as u32);
+            self.update_uniform_buffer(self.current_frame as u32, frame_data);
 
             // Only reset the fence if we are submitting work
             self.device

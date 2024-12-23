@@ -3,7 +3,7 @@ use rust_vulkan::ui::UiBuilder;
 use winit::error::EventLoopError;
 use winit::event_loop::{ControlFlow, EventLoop};
 
-use glam::Vec4;
+use glam::{Vec2, Vec3, Vec4};
 use rust_vulkan::app::App;
 use rust_vulkan::frame_data::FrameData;
 
@@ -11,6 +11,11 @@ struct UiTut {
     color: Vec4,
     frame_limiter: bool,
     frame_limiter_limit: i32,
+    rotate_model: bool,
+    cam_eye: Vec3,
+    cam_center: Vec3,
+    cam_up: Vec3,
+    cam_nearfar: Vec2,
 }
 
 impl Default for UiTut {
@@ -19,6 +24,11 @@ impl Default for UiTut {
             color: Vec4::new(0.0, 0.0, 0.0, 0.0),
             frame_limiter: true,
             frame_limiter_limit: 60 as i32,
+            rotate_model: true,
+            cam_eye: Vec3::splat(2.0),
+            cam_center: Vec3::new(0.5, 0.0, 0.5),
+            cam_up: Vec3::Z,
+            cam_nearfar: Vec2::new(0.1, 10.0),
         }
     }
 }
@@ -38,6 +48,20 @@ impl UiBuilder for UiTut {
                 }
                 ui.text_wrapped(format!("FPS: {:.0}", ui.io().framerate));
                 ui.separator();
+                ui.checkbox("Rotate Model", &mut self.rotate_model);
+
+                ui.separator();
+                ui.text_wrapped("Background color");
+                ui.color_picker4("##picker", &mut self.color);
+
+                ui.separator();
+                ui.text_wrapped("Camera Settings");
+                ui.input_float3("Eye", &mut self.cam_eye).build();
+                ui.input_float3("Center", &mut self.cam_center).build();
+                ui.input_float3("Up", &mut self.cam_up).build();
+                ui.input_float2("Near/Far", &mut self.cam_nearfar).build();
+
+                ui.separator();
                 let mouse_pos = ui.io().mouse_pos;
                 if mouse_pos[0] != f32::MIN {
                     ui.text(format!(
@@ -45,18 +69,20 @@ impl UiBuilder for UiTut {
                         mouse_pos[0], mouse_pos[1]
                     ));
                 }
-
-                ui.separator();
-                ui.color_picker4("##picker", &mut self.color);
             });
     }
 
     fn frame_data(&self) -> FrameData {
-        return FrameData {
+        FrameData {
             bgcolor: self.color,
             frame_limiter: self.frame_limiter,
             frame_limiter_fps: self.frame_limiter_limit as u32,
-        };
+            rotate_model: self.rotate_model,
+            cam_eye: self.cam_eye,
+            cam_center: self.cam_center,
+            cam_up: self.cam_up,
+            cam_nearfar: self.cam_nearfar,
+        }
     }
 }
 
