@@ -1,5 +1,5 @@
 
-The [Vulkan tutorial](https://vulkan-tutorial.com/) reimplemented in Rust, with some extras and an opinionated choice of underlying crates. Development on arm64 macOS.
+The [Vulkan tutorial](https://vulkan-tutorial.com/) reimplemented in Rust, with some extras and an opinionated choice of underlying crates. Tested on arm64 macOS and Asahi Linux.
 
 ## Crates
 - [ash](https://github.com/ash-rs/ash)

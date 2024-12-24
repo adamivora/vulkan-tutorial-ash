@@ -264,6 +264,9 @@ pub struct Vulkan {
     current_frame: usize,
     framebuffer_resized: bool,
     is_rendering: bool,
+
+    #[allow(dead_code)]
+    entry: Entry,
 }
 
 struct VulkanInit;
@@ -276,8 +279,11 @@ impl VulkanInit {
         event_loop.create_window(window_attributes).unwrap()
     }
 
-    fn create_instance(window: &Window) -> Result<ash::Instance, Box<dyn std::error::Error>> {
-        if ENABLE_VALIDATION_LAYERS && !Self::check_validation_layer_support()? {
+    fn create_instance(
+        entry: &Entry,
+        window: &Window,
+    ) -> Result<ash::Instance, Box<dyn std::error::Error>> {
+        if ENABLE_VALIDATION_LAYERS && !Self::check_validation_layer_support(entry)? {
             return Err("validation layers requested, but not available!".into());
         }
 
@@ -291,6 +297,7 @@ impl VulkanInit {
             .engine_version(vk::make_api_version(0, 1, 0, 0))
             .api_version(vk::API_VERSION_1_0);
 
+        #[allow(unused_mut)]
         let mut extensions =
             ash_window::enumerate_required_extensions(window.display_handle()?.as_raw())?.to_vec();
 
@@ -331,8 +338,6 @@ impl VulkanInit {
             debug_create_info = Self::populate_debug_messenger_create_info(debug_create_info);
             create_info = create_info.push_next(&mut debug_create_info);
         }
-
-        let entry = Entry::linked();
 
         let instance = unsafe { entry.create_instance(&create_info, None)? };
         let supported_extensions: Vec<vk::ExtensionProperties> =
@@ -437,8 +442,7 @@ impl VulkanInit {
         Result::Ok(physical_device.clone())
     }
 
-    fn check_validation_layer_support() -> Result<bool, vk::Result> {
-        let entry = Entry::linked();
+    fn check_validation_layer_support(entry: &Entry) -> Result<bool, vk::Result> {
         let available_layers: Vec<vk::LayerProperties> =
             unsafe { entry.enumerate_instance_layer_properties()? };
 
@@ -470,6 +474,7 @@ impl VulkanInit {
 
     #[cfg(debug_assertions)]
     fn setup_debug_messenger(
+        entry: &Entry,
         instance: &ash::Instance,
     ) -> Result<
         (ash::ext::debug_utils::Instance, vk::DebugUtilsMessengerEXT),
@@ -482,7 +487,6 @@ impl VulkanInit {
         let create_info = Self::populate_debug_messenger_create_info(
             vk::DebugUtilsMessengerCreateInfoEXT::default(),
         );
-        let entry = Entry::linked();
         let debug_utils_loader = debug_utils::Instance::new(&entry, instance);
         let debug_callback =
             unsafe { debug_utils_loader.create_debug_utils_messenger(&create_info, None)? };
@@ -520,8 +524,11 @@ impl VulkanInit {
             .sampler_anisotropy(true)
             .sample_rate_shading(true);
 
-        let mut extensions: Vec<*const i8> =
-            DEVICE_EXTENSIONS.iter().map(|&ext| ext.as_ptr()).collect();
+        #[allow(unused_mut)]
+        let mut extensions: Vec<*const c_char> = DEVICE_EXTENSIONS
+            .iter()
+            .map(|&ext| ext.as_ptr() as *const c_char)
+            .collect();
         #[cfg(any(target_os = "macos", target_os = "ios"))]
         {
             extensions.push(ash::khr::portability_subset::NAME.as_ptr());
@@ -540,10 +547,10 @@ impl VulkanInit {
     }
 
     fn create_surface(
+        entry: &Entry,
         window: &Window,
         instance: &ash::Instance,
     ) -> Result<(ash::khr::surface::Instance, vk::SurfaceKHR), Box<dyn std::error::Error>> {
-        let entry = Entry::linked();
         let surface = unsafe {
             ash_window::create_surface(
                 &entry,
@@ -672,10 +679,11 @@ impl VulkanInit {
     }
 
     fn init_vulkan(window: &Window) -> Result<Vulkan, Box<dyn std::error::Error>> {
-        let instance = Self::create_instance(window)?;
+        let entry = unsafe { Entry::load()? };
+        let instance = Self::create_instance(&entry, window)?;
         #[cfg(debug_assertions)]
-        let (debug_utils_loader, debug_callback) = Self::setup_debug_messenger(&instance)?;
-        let (surface_instance, surface) = Self::create_surface(window, &instance)?;
+        let (debug_utils_loader, debug_callback) = Self::setup_debug_messenger(&entry, &instance)?;
+        let (surface_instance, surface) = Self::create_surface(&entry, window, &instance)?;
         let physical_device = Self::pick_physical_device(&instance, &surface_instance, surface)?;
         let (device, graphics_queue, present_queue) =
             Self::create_logical_device(&instance, physical_device, &surface_instance, surface)?;
@@ -696,6 +704,7 @@ impl VulkanInit {
         let msaa_samples = VulkanInit::get_max_usable_sample_count(&instance, physical_device);
 
         let mut vulkan = Vulkan {
+            entry,
             instance,
             device,
             physical_device,
