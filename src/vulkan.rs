@@ -101,7 +101,17 @@ const VALIDATION_LAYERS: [&CStr; 1] =
     [unsafe { CStr::from_bytes_with_nul_unchecked(b"VK_LAYER_KHRONOS_validation\0") }];
 const ENABLE_VALIDATION_LAYERS: bool = cfg!(debug_assertions);
 
-const DEVICE_EXTENSIONS: [&CStr; 2] = [vk::KHR_SWAPCHAIN_NAME, vk::KHR_MAINTENANCE1_NAME];
+const DEVICE_EXTENSIONS: [&CStr; 9] = [
+    vk::KHR_SWAPCHAIN_NAME,
+    vk::KHR_MAINTENANCE1_NAME,
+    vk::KHR_RAY_TRACING_PIPELINE_NAME,
+    vk::KHR_ACCELERATION_STRUCTURE_NAME,
+    vk::KHR_DEFERRED_HOST_OPERATIONS_NAME,
+    vk::KHR_SPIRV_1_4_NAME,
+    vk::EXT_DESCRIPTOR_INDEXING_NAME,
+    vk::KHR_BUFFER_DEVICE_ADDRESS_NAME,
+    vk::KHR_SHADER_FLOAT_CONTROLS_NAME,
+];
 
 unsafe extern "system" fn messenger_debug_callback(
     _message_severity: vk::DebugUtilsMessageSeverityFlagsEXT,
@@ -295,7 +305,7 @@ impl VulkanInit {
             .application_version(vk::make_api_version(0, 1, 0, 0))
             .engine_name(&engine_name)
             .engine_version(vk::make_api_version(0, 1, 0, 0))
-            .api_version(vk::API_VERSION_1_0);
+            .api_version(vk::API_VERSION_1_1);
 
         #[allow(unused_mut)]
         let mut extensions =
@@ -533,6 +543,10 @@ impl VulkanInit {
         {
             extensions.push(ash::khr::portability_subset::NAME.as_ptr());
         }
+
+        extensions.push(vk::KHR_ACCELERATION_STRUCTURE_NAME.as_ptr());
+        extensions.push(vk::KHR_RAY_TRACING_PIPELINE_NAME.as_ptr());
+        extensions.push(vk::KHR_DEFERRED_HOST_OPERATIONS_NAME.as_ptr());
 
         let create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
