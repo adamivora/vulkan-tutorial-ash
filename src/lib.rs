@@ -1,4 +1,5 @@
 pub mod app;
+pub mod buffer;
 pub mod frame_data;
 pub mod obj_loader;
 pub mod ui;

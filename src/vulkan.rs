@@ -1,3 +1,4 @@
+use crate::buffer::{BoundBuffer, BoundBufferMapped, BoundImage, VulkanBuffers};
 use crate::frame_data::FrameData;
 use crate::obj_loader::ObjLoader;
 #[cfg(debug_assertions)]
@@ -7,29 +8,25 @@ use ash::util::Align;
 use ash::vk;
 use ash::Entry;
 use glam::{Mat4, Vec2, Vec3};
-use image::EncodableLayout;
-use image::ImageReader;
+use image::{EncodableLayout, ImageReader};
 use imgui::DrawData;
 use imgui_rs_vulkan_renderer::Renderer as ImguiRenderer;
 use serde::Serialize;
 use serde_binary::binary_stream::Endian;
 use std::borrow::Cow;
 use std::cmp;
-use std::collections::HashMap;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::convert::TryFrom;
-use std::ffi::c_void;
-use std::ffi::{CStr, CString};
+use std::ffi::{c_void, CStr, CString};
 use std::fs;
 use std::hash::Hash;
 use std::iter::zip;
-use std::mem::offset_of;
+use std::mem::{offset_of, ManuallyDrop};
 use std::os::raw::c_char;
-use std::sync::LazyLock;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::Instant;
 use std::u32;
-use vk_mem::{Allocator, AllocatorCreateInfo};
+use vk_mem::{Alloc, Allocation, Allocator, AllocatorCreateInfo, MemoryUsage};
 use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle};
 use winit::window::Window;
@@ -208,13 +205,14 @@ impl SwapChainSupportDetails {
 }
 
 pub struct Vulkan {
+    allocator: Arc<Mutex<vk_mem::Allocator>>,
     instance: ash::Instance,
     #[cfg(debug_assertions)]
     debug_utils_loader: ash::ext::debug_utils::Instance,
     surface_instance: ash::khr::surface::Instance,
     swapchain_device: ash::khr::swapchain::Device,
     device: ash::Device,
-    // only handles from now on
+    // handles from now on
     #[cfg(debug_assertions)]
     debug_callback: vk::DebugUtilsMessengerEXT,
     physical_device: vk::PhysicalDevice,
@@ -236,25 +234,9 @@ pub struct Vulkan {
     image_available_semaphores: Vec<vk::Semaphore>,
     render_finished_semaphores: Vec<vk::Semaphore>,
     in_flight_fences: Vec<vk::Fence>,
-    vertex_buffer: vk::Buffer,
-    vertex_buffer_memory: vk::DeviceMemory,
-    index_buffer: vk::Buffer,
-    index_buffer_memory: vk::DeviceMemory,
-    uniform_buffers: Vec<vk::Buffer>,
-    uniform_buffers_memory: Vec<vk::DeviceMemory>,
-    uniform_buffers_mapped: Vec<*mut c_void>,
     descriptor_pool: vk::DescriptorPool,
     descriptor_sets: Vec<vk::DescriptorSet>,
-    texture_image: vk::Image,
-    texture_image_memory: vk::DeviceMemory,
-    texture_image_view: vk::ImageView,
     texture_sampler: vk::Sampler,
-    color_image: vk::Image,
-    color_image_memory: vk::DeviceMemory,
-    color_image_view: vk::ImageView,
-    depth_image: vk::Image,
-    depth_image_memory: vk::DeviceMemory,
-    depth_image_view: vk::ImageView,
 
     vertices: Vec<Vertex>,
     indices: Vec<u32>,
@@ -638,6 +620,16 @@ impl VulkanInit {
         ))
     }
 
+    fn create_allocator(
+        instance: &ash::Instance,
+        device: &ash::Device,
+        physical_device: vk::PhysicalDevice,
+    ) -> Result<Arc<Mutex<Allocator>>, vk::Result> {
+        let allocator_create_info = AllocatorCreateInfo::new(&instance, &device, physical_device);
+        let allocator = { unsafe { Allocator::new(allocator_create_info)? } };
+        Result::Ok(Arc::new(Mutex::new(allocator)))
+    }
+
     fn find_queue_families(
         instance: &ash::Instance,
         device: ash::vk::PhysicalDevice,
@@ -678,7 +670,7 @@ impl VulkanInit {
         })
     }
 
-    fn init_vulkan(window: &Window) -> Result<Vulkan, Box<dyn std::error::Error>> {
+    fn init_vulkan(window: &Window) -> Result<(Vulkan, VulkanBuffers), Box<dyn std::error::Error>> {
         let entry = unsafe { Entry::load()? };
         let instance = Self::create_instance(&entry, window)?;
         #[cfg(debug_assertions)]
@@ -701,9 +693,11 @@ impl VulkanInit {
             physical_device,
             &device,
         )?;
+        let allocator = VulkanInit::create_allocator(&instance, &device, physical_device)?;
         let msaa_samples = VulkanInit::get_max_usable_sample_count(&instance, physical_device);
 
         let mut vulkan = Vulkan {
+            allocator,
             entry,
             instance,
             device,
@@ -721,6 +715,7 @@ impl VulkanInit {
             swapchain_images,
             swapchain_image_format,
             swapchain_extent,
+            msaa_samples,
             swapchain_image_views: Vec::new(),
             swapchain_framebuffers: Vec::new(),
             render_pass: vk::RenderPass::null(),
@@ -732,29 +727,12 @@ impl VulkanInit {
             image_available_semaphores: Vec::new(),
             render_finished_semaphores: Vec::new(),
             in_flight_fences: Vec::new(),
-            vertex_buffer: vk::Buffer::null(),
-            vertex_buffer_memory: vk::DeviceMemory::null(),
-            index_buffer: vk::Buffer::null(),
-            index_buffer_memory: vk::DeviceMemory::null(),
-            uniform_buffers: Vec::new(),
-            uniform_buffers_memory: Vec::new(),
-            uniform_buffers_mapped: Vec::new(),
+            texture_sampler: vk::Sampler::null(),
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_sets: Vec::new(),
-            texture_image: vk::Image::null(),
-            texture_image_memory: vk::DeviceMemory::null(),
-            texture_image_view: vk::ImageView::null(),
-            texture_sampler: vk::Sampler::null(),
-            color_image: vk::Image::null(),
-            color_image_memory: vk::DeviceMemory::null(),
-            color_image_view: vk::ImageView::null(),
-            depth_image: vk::Image::null(),
-            depth_image_memory: vk::DeviceMemory::null(),
-            depth_image_view: vk::ImageView::null(),
             vertices: Vec::new(),
             indices: Vec::new(),
             mip_levels: 0,
-            msaa_samples: msaa_samples,
             current_frame: 0,
             framebuffer_resized: false,
             is_rendering: true,
@@ -765,57 +743,42 @@ impl VulkanInit {
         vulkan.create_descriptor_set_layout()?;
         vulkan.create_graphics_pipeline()?;
         vulkan.create_command_pool()?;
-        vulkan.create_color_resources()?;
-        vulkan.create_depth_resources()?;
-        vulkan.create_framebuffers()?;
-        vulkan.create_texture_image()?;
-        vulkan.create_texture_image_view()?;
+        let allocator_mutex = vulkan.allocator.clone();
+        let mut allocator = allocator_mutex.lock().expect("cannot lock allocator");
+        let color_image = vulkan.create_color_resources(&mut allocator)?;
+        let depth_image = vulkan.create_depth_resources(&mut allocator)?;
+        vulkan.create_framebuffers(color_image.image_view, depth_image.image_view)?;
+        let texture_image = vulkan.create_texture_image(&mut allocator)?;
         vulkan.create_texture_sampler()?;
         vulkan.load_model()?;
-        vulkan.create_vertex_buffer()?;
-        vulkan.create_index_buffer()?;
-        vulkan.create_uniform_buffers()?;
+        let vertex_buffer = vulkan.create_vertex_buffer(&mut allocator, &vulkan.vertices)?;
+        let index_buffer = vulkan.create_index_buffer(&mut allocator, &vulkan.indices)?;
+        let uniform_buffers = vulkan.create_uniform_buffers(&mut allocator)?;
         vulkan.create_descriptor_pool()?;
-        vulkan.create_descriptor_sets()?;
+        vulkan.create_descriptor_sets(texture_image.image_view, &uniform_buffers)?;
         vulkan.create_command_buffers()?;
         vulkan.create_sync_objects()?;
 
-        Result::Ok(vulkan)
+        let buffers = VulkanBuffers {
+            vertex: vertex_buffer,
+            index: index_buffer,
+            uniforms: uniform_buffers,
+            texture: texture_image,
+            color: color_image,
+            depth: depth_image,
+        };
+
+        Result::Ok((vulkan, buffers))
     }
 }
 
 impl Vulkan {
     pub fn new(
         event_loop: &ActiveEventLoop,
-    ) -> Result<(Window, Vulkan), Box<dyn std::error::Error>> {
+    ) -> Result<(Window, Vulkan, VulkanBuffers), Box<dyn std::error::Error>> {
         let window = VulkanInit::init_window(event_loop);
-        let vulkan = VulkanInit::init_vulkan(&window)?;
-        Result::Ok((window, vulkan))
-    }
-
-    fn find_memory_type(
-        &self,
-        type_filter: u32,
-        properties: vk::MemoryPropertyFlags,
-    ) -> Option<u32> {
-        let mem_properties = unsafe {
-            self.instance
-                .get_physical_device_memory_properties(self.physical_device)
-        };
-        let result = mem_properties
-            .memory_types
-            .iter()
-            .enumerate()
-            .find(|&(i, &memory_type)| {
-                let type_matches = (type_filter & (1 << i)) != 0;
-                let memory_matches = (memory_type.property_flags & properties) == properties;
-                type_matches && memory_matches
-            });
-        if let Some((i, _)) = result {
-            Some(i as u32)
-        } else {
-            None
-        }
+        let (vulkan, buffers) = VulkanInit::init_vulkan(&window)?;
+        Result::Ok((window, vulkan, buffers))
     }
 
     fn read_file(filename: &str) -> Result<std::fs::File, Box<dyn std::error::Error>> {
@@ -840,6 +803,7 @@ impl Vulkan {
         imgui_renderer: &mut ImguiRenderer,
         imgui_draw_data: &DrawData,
         frame_data: &FrameData,
+        buffers: &VulkanBuffers,
     ) -> VkResult<()> {
         let begin_info = vk::CommandBufferBeginInfo::default();
         let command_buffer = self.command_buffers[self.current_frame];
@@ -885,14 +849,14 @@ impl Vulkan {
             );
         }
 
-        let vertex_buffers = [self.vertex_buffer];
+        let vertex_buffers = [buffers.vertex.buffer];
         let offsets = [0];
         unsafe {
             self.device
                 .cmd_bind_vertex_buffers(command_buffer, 0, &vertex_buffers, &offsets);
             self.device.cmd_bind_index_buffer(
                 command_buffer,
-                self.index_buffer,
+                buffers.index.buffer,
                 0,
                 vk::IndexType::UINT32,
             );
@@ -943,15 +907,8 @@ impl Vulkan {
         imgui: &mut imgui::Context,
     ) -> Result<ImguiRenderer, Box<dyn std::error::Error>> {
         let imgui_renderer = {
-            let allocator = {
-                let allocator_create_info =
-                    AllocatorCreateInfo::new(&self.instance, &self.device, self.physical_device);
-
-                unsafe { Allocator::new(allocator_create_info)? }
-            };
-
             ImguiRenderer::with_vk_mem_allocator(
-                Arc::new(Mutex::new(allocator)),
+                self.allocator.clone(),
                 self.device.clone(),
                 self.graphics_queue,
                 self.command_pool,
@@ -968,31 +925,28 @@ impl Vulkan {
     }
 
     fn create_buffer(
-        &self,
+        allocator: &mut MutexGuard<Allocator>,
         size: vk::DeviceSize,
         usage: vk::BufferUsageFlags,
         properties: vk::MemoryPropertyFlags,
-    ) -> Result<(vk::Buffer, vk::DeviceMemory), Box<dyn std::error::Error>> {
+    ) -> Result<BoundBuffer, Box<dyn std::error::Error>> {
         let buffer_info = vk::BufferCreateInfo::default()
             .size(size)
             .usage(usage)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
 
-        let buffer = unsafe { self.device.create_buffer(&buffer_info, None)? };
-        let mem_requirements = unsafe { self.device.get_buffer_memory_requirements(buffer) };
+        let allocate_info = vk_mem::AllocationCreateInfo {
+            required_flags: properties,
+            ..Default::default()
+        };
 
-        let memory_type_index = self
-            .find_memory_type(mem_requirements.memory_type_bits, properties)
-            .ok_or("failed to find suitable memory type!")?;
+        let (buffer, buffer_allocation) =
+            unsafe { allocator.create_buffer(&buffer_info, &allocate_info)? };
 
-        let allocate_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(memory_type_index);
-
-        let buffer_memory = unsafe { self.device.allocate_memory(&allocate_info, None)? };
-
-        unsafe { self.device.bind_buffer_memory(buffer, buffer_memory, 0)? };
-        Result::Ok((buffer, buffer_memory))
+        Result::Ok(BoundBuffer {
+            buffer,
+            allocation: buffer_allocation,
+        })
     }
 
     fn begin_single_time_commands(&self) -> VkResult<vk::CommandBuffer> {
@@ -1048,16 +1002,15 @@ impl Vulkan {
 
     fn copy_cpu_to_gpu<T: Copy>(
         &self,
-        device_memory: vk::DeviceMemory,
+        allocator: &mut MutexGuard<Allocator>,
+        allocation: &mut Allocation,
         from: &[T],
         size: vk::DeviceSize,
     ) -> VkResult<()> {
         unsafe {
-            let data =
-                self.device
-                    .map_memory(device_memory, 0, size, vk::MemoryMapFlags::empty())?;
+            let data = allocator.map_memory(allocation)? as *mut c_void;
             Self::copy_to_ptr(data, from, size);
-            self.device.unmap_memory(device_memory);
+            allocator.unmap_memory(allocation);
         }
 
         Result::Ok(())
@@ -1306,12 +1259,16 @@ impl Vulkan {
         Result::Ok(())
     }
 
-    fn create_framebuffers(&mut self) -> VkResult<()> {
+    fn create_framebuffers(
+        &mut self,
+        color_image_view: vk::ImageView,
+        depth_image_view: vk::ImageView,
+    ) -> VkResult<()> {
         self.swapchain_framebuffers = self
             .swapchain_image_views
             .iter()
             .map(|&view| {
-                let attachments = [self.color_image_view, self.depth_image_view, view];
+                let attachments = [color_image_view, depth_image_view, view];
 
                 let framebuffer_info = vk::FramebufferCreateInfo::default()
                     .render_pass(self.render_pass)
@@ -1389,10 +1346,14 @@ impl Vulkan {
         }
     }
 
-    fn create_color_resources(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn create_color_resources(
+        &mut self,
+        allocator: &mut MutexGuard<Allocator>,
+    ) -> Result<BoundImage, Box<dyn std::error::Error>> {
         let color_format = self.swapchain_image_format;
 
-        (self.color_image, self.color_image_memory) = self.create_image(
+        let (color_image, color_allocation) = Self::create_image(
+            allocator,
             self.swapchain_extent.width,
             self.swapchain_extent.height,
             1,
@@ -1402,19 +1363,23 @@ impl Vulkan {
             vk::ImageUsageFlags::TRANSIENT_ATTACHMENT | vk::ImageUsageFlags::COLOR_ATTACHMENT,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
-        self.color_image_view = self.create_image_view(
-            self.color_image,
-            color_format,
-            vk::ImageAspectFlags::COLOR,
-            1,
-        )?;
+        let color_image_view =
+            self.create_image_view(color_image, color_format, vk::ImageAspectFlags::COLOR, 1)?;
 
-        Result::Ok(())
+        Result::Ok(BoundImage {
+            image: color_image,
+            image_view: color_image_view,
+            allocation: color_allocation,
+        })
     }
 
-    fn create_depth_resources(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn create_depth_resources(
+        &mut self,
+        allocator: &mut MutexGuard<Allocator>,
+    ) -> Result<BoundImage, Box<dyn std::error::Error>> {
         let depth_format = self.find_depth_format()?;
-        (self.depth_image, self.depth_image_memory) = self.create_image(
+        let (depth_image, depth_image_allocation) = Self::create_image(
+            allocator,
             self.swapchain_extent.width,
             self.swapchain_extent.height,
             1,
@@ -1424,24 +1389,24 @@ impl Vulkan {
             vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
-        self.depth_image_view = self.create_image_view(
-            self.depth_image,
-            depth_format,
-            vk::ImageAspectFlags::DEPTH,
-            1,
-        )?;
+        let depth_image_view =
+            self.create_image_view(depth_image, depth_format, vk::ImageAspectFlags::DEPTH, 1)?;
         self.transition_image_layout(
-            self.depth_image,
+            depth_image,
             depth_format,
             vk::ImageLayout::UNDEFINED,
             vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
             1,
         )?;
-        Result::Ok(())
+        Result::Ok(BoundImage {
+            image: depth_image,
+            image_view: depth_image_view,
+            allocation: depth_image_allocation,
+        })
     }
 
     fn create_image(
-        &self,
+        allocator: &mut MutexGuard<Allocator>,
         width: u32,
         height: u32,
         mip_levels: u32,
@@ -1450,7 +1415,7 @@ impl Vulkan {
         tiling: vk::ImageTiling,
         usage: vk::ImageUsageFlags,
         properties: vk::MemoryPropertyFlags,
-    ) -> Result<(vk::Image, vk::DeviceMemory), Box<dyn std::error::Error>> {
+    ) -> Result<(vk::Image, vk_mem::Allocation), Box<dyn std::error::Error>> {
         let image_info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .extent(vk::Extent3D {
@@ -1467,20 +1432,16 @@ impl Vulkan {
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
             .samples(num_samples);
 
-        let image = unsafe { self.device.create_image(&image_info, None)? };
-        let mem_requirements = unsafe { self.device.get_image_memory_requirements(image) };
-        let memory_type_index = self
-            .find_memory_type(mem_requirements.memory_type_bits, properties)
-            .ok_or("cannot find memory type")?;
-        let alloc_info = vk::MemoryAllocateInfo::default()
-            .allocation_size(mem_requirements.size)
-            .memory_type_index(memory_type_index);
+        let alloc_info = vk_mem::AllocationCreateInfo {
+            usage: MemoryUsage::AutoPreferHost,
+            required_flags: properties,
+            ..Default::default()
+        };
 
-        let image_memory = unsafe { self.device.allocate_memory(&alloc_info, None)? };
-        unsafe {
-            self.device.bind_image_memory(image, image_memory, 0)?;
-        }
-        Result::Ok((image, image_memory))
+        let (image, image_allocation) =
+            unsafe { allocator.create_image(&image_info, &alloc_info)? };
+
+        Result::Ok((image, image_allocation))
     }
 
     fn transition_image_layout(
@@ -1607,21 +1568,31 @@ impl Vulkan {
         Result::Ok(())
     }
 
-    fn create_texture_image(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn create_texture_image(
+        &mut self,
+        allocator: &mut MutexGuard<Allocator>,
+    ) -> Result<BoundImage, Box<dyn std::error::Error>> {
         let img = ImageReader::open(TEXTURE_PATH)?.decode()?.into_rgba8();
         let (tex_width, tex_height) = (img.width(), img.height());
         let pixels = img.as_bytes();
         let image_size = (tex_width as vk::DeviceSize) * (tex_height as vk::DeviceSize) * 4;
         self.mip_levels = cmp::max(tex_width, tex_height).ilog2() + 1;
 
-        let (staging_buffer, staging_buffer_memory) = self.create_buffer(
+        let mut staging_buffer = Self::create_buffer(
+            allocator,
             image_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
-        self.copy_cpu_to_gpu(staging_buffer_memory, pixels, image_size)?;
+        self.copy_cpu_to_gpu(
+            allocator,
+            &mut staging_buffer.allocation,
+            pixels,
+            image_size,
+        )?;
 
-        let (texture_image, texture_image_memory) = self.create_image(
+        let (texture_image, texture_image_allocation) = Self::create_image(
+            allocator,
             tex_width,
             tex_height,
             self.mip_levels,
@@ -1641,7 +1612,7 @@ impl Vulkan {
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             self.mip_levels,
         )?;
-        self.copy_buffer_to_image(staging_buffer, texture_image, tex_width, tex_height)?;
+        self.copy_buffer_to_image(staging_buffer.buffer, texture_image, tex_width, tex_height)?;
         // transitioned to VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL while generating mipmaps
 
         self.generate_bitmaps(
@@ -1653,13 +1624,21 @@ impl Vulkan {
         )?;
 
         unsafe {
-            self.device.destroy_buffer(staging_buffer, None);
-            self.device.free_memory(staging_buffer_memory, None);
+            allocator.destroy_buffer(staging_buffer.buffer, &mut staging_buffer.allocation);
         }
 
-        self.texture_image = texture_image;
-        self.texture_image_memory = texture_image_memory;
-        Result::Ok(())
+        let texture_image_view = self.create_image_view(
+            texture_image,
+            vk::Format::R8G8B8A8_SRGB,
+            vk::ImageAspectFlags::COLOR,
+            self.mip_levels,
+        )?;
+
+        Result::Ok(BoundImage {
+            image: texture_image,
+            image_view: texture_image_view,
+            allocation: texture_image_allocation,
+        })
     }
 
     fn create_image_view(
@@ -1684,16 +1663,6 @@ impl Vulkan {
 
         let image_view = unsafe { self.device.create_image_view(&view_info, None)? };
         Result::Ok(image_view)
-    }
-
-    fn create_texture_image_view(&mut self) -> VkResult<()> {
-        self.texture_image_view = self.create_image_view(
-            self.texture_image,
-            vk::Format::R8G8B8A8_SRGB,
-            vk::ImageAspectFlags::COLOR,
-            self.mip_levels,
-        )?;
-        Result::Ok(())
     }
 
     fn create_texture_sampler(&mut self) -> VkResult<()> {
@@ -1727,81 +1696,101 @@ impl Vulkan {
         Result::Ok(())
     }
 
-    fn create_vertex_buffer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let buffer_size: u64 = size_of::<Vertex>() as u64 * self.vertices.len() as u64;
-        let (staging_buffer, staging_buffer_memory) = self.create_buffer(
+    fn create_vertex_buffer(
+        &self,
+        allocator: &mut MutexGuard<Allocator>,
+        vertices: &Vec<Vertex>,
+    ) -> Result<BoundBuffer, Box<dyn std::error::Error>> {
+        let buffer_size: u64 = size_of::<Vertex>() as u64 * vertices.len() as u64;
+        let mut staging_buffer = Self::create_buffer(
+            allocator,
             buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
-        self.copy_cpu_to_gpu(staging_buffer_memory, &self.vertices, buffer_size)?;
+        self.copy_cpu_to_gpu(
+            allocator,
+            &mut staging_buffer.allocation,
+            vertices,
+            buffer_size,
+        )?;
 
-        let (vertex_buffer, vertex_buffer_memory) = self.create_buffer(
+        let vertex_buffer = Self::create_buffer(
+            allocator,
             buffer_size,
             vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::VERTEX_BUFFER,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
-        self.copy_buffer(staging_buffer, vertex_buffer, buffer_size)?;
+        self.copy_buffer(staging_buffer.buffer, vertex_buffer.buffer, buffer_size)?;
 
         unsafe {
-            self.device.destroy_buffer(staging_buffer, None);
-            self.device.free_memory(staging_buffer_memory, None);
+            allocator.destroy_buffer(staging_buffer.buffer, &mut staging_buffer.allocation);
         }
 
-        self.vertex_buffer = vertex_buffer;
-        self.vertex_buffer_memory = vertex_buffer_memory;
-        Result::Ok(())
+        Result::Ok(vertex_buffer)
     }
 
-    fn create_index_buffer(&mut self) -> Result<(), Box<dyn std::error::Error>> {
-        let buffer_size: u64 = size_of::<u32>() as u64 * self.indices.len() as u64;
-        let (staging_buffer, staging_buffer_memory) = self.create_buffer(
+    fn create_index_buffer(
+        &self,
+        allocator: &mut MutexGuard<Allocator>,
+        indices: &Vec<u32>,
+    ) -> Result<BoundBuffer, Box<dyn std::error::Error>> {
+        let buffer_size: u64 = size_of::<u32>() as u64 * indices.len() as u64;
+        let mut staging_buffer = Self::create_buffer(
+            allocator,
             buffer_size,
             vk::BufferUsageFlags::TRANSFER_SRC,
             vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
         )?;
 
-        self.copy_cpu_to_gpu(staging_buffer_memory, &self.indices, buffer_size)?;
+        self.copy_cpu_to_gpu(
+            allocator,
+            &mut staging_buffer.allocation,
+            indices,
+            buffer_size,
+        )?;
 
-        let (index_buffer, index_buffer_memory) = self.create_buffer(
+        let index_buffer = Self::create_buffer(
+            allocator,
             buffer_size,
             vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::INDEX_BUFFER,
             vk::MemoryPropertyFlags::DEVICE_LOCAL,
         )?;
-        self.copy_buffer(staging_buffer, index_buffer, buffer_size)?;
+        self.copy_buffer(staging_buffer.buffer, index_buffer.buffer, buffer_size)?;
 
         unsafe {
-            self.device.destroy_buffer(staging_buffer, None);
-            self.device.free_memory(staging_buffer_memory, None);
+            allocator.destroy_buffer(staging_buffer.buffer, &mut staging_buffer.allocation);
         }
-
-        self.index_buffer = index_buffer;
-        self.index_buffer_memory = index_buffer_memory;
-        Result::Ok(())
+        Result::Ok(index_buffer)
     }
 
-    fn create_uniform_buffers(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    fn create_uniform_buffers(
+        &self,
+        allocator: &mut MutexGuard<Allocator>,
+    ) -> Result<Vec<BoundBufferMapped>, Box<dyn std::error::Error>> {
         let buffer_size = size_of::<UniformBufferObject>() as vk::DeviceSize;
 
+        let mut uniform_buffers = Vec::new();
         for _i in 0..MAX_FRAMES_IN_FLIGHT {
-            let (uniform_buffer, uniform_buffer_memory) = self.create_buffer(
+            let mut uniform_buffer = Self::create_buffer(
+                allocator,
                 buffer_size,
                 vk::BufferUsageFlags::UNIFORM_BUFFER,
                 vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT,
             )?;
-            self.uniform_buffers.push(uniform_buffer);
-            self.uniform_buffers_memory.push(uniform_buffer_memory);
-            self.uniform_buffers_mapped.push(unsafe {
-                self.device.map_memory(
-                    uniform_buffer_memory,
-                    0,
-                    buffer_size,
-                    vk::MemoryMapFlags::empty(),
-                )?
-            });
+
+            let uniform_buffer = BoundBufferMapped {
+                ptr: unsafe {
+                    allocator.map_memory(&mut uniform_buffer.allocation)? as *mut c_void
+                },
+                buffer: uniform_buffer.buffer,
+                allocation: uniform_buffer.allocation,
+            };
+
+            uniform_buffers.push(uniform_buffer);
         }
-        Result::Ok(())
+        Result::Ok(uniform_buffers)
     }
 
     fn create_descriptor_pool(&mut self) -> VkResult<()> {
@@ -1821,7 +1810,11 @@ impl Vulkan {
         Result::Ok(())
     }
 
-    fn create_descriptor_sets(&mut self) -> VkResult<()> {
+    fn create_descriptor_sets(
+        &mut self,
+        texture_image_view: vk::ImageView,
+        uniform_buffers: &Vec<BoundBufferMapped>,
+    ) -> VkResult<()> {
         let layouts = [self.descriptor_set_layout; MAX_FRAMES_IN_FLIGHT as usize];
         let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
@@ -1830,12 +1823,12 @@ impl Vulkan {
         self.descriptor_sets = unsafe { self.device.allocate_descriptor_sets(&alloc_info)? };
         for i in 0..MAX_FRAMES_IN_FLIGHT as usize {
             let buffer_infos = [vk::DescriptorBufferInfo::default()
-                .buffer(self.uniform_buffers[i])
+                .buffer(uniform_buffers[i].buffer)
                 .offset(0)
                 .range(size_of::<UniformBufferObject>() as vk::DeviceSize)];
             let image_infos = [vk::DescriptorImageInfo::default()
                 .image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)
-                .image_view(self.texture_image_view)
+                .image_view(texture_image_view)
                 .sampler(self.texture_sampler)];
             let descriptor_writes = [
                 vk::WriteDescriptorSet::default()
@@ -2087,34 +2080,37 @@ impl Vulkan {
         Result::Ok(())
     }
 
-    fn cleanup(&mut self) {
+    pub fn cleanup(self, buffers: &mut VulkanBuffers, renderer: &mut ManuallyDrop<ImguiRenderer>) {
+        log::debug!("Destroying Vulkan...");
         unsafe {
-            self.cleanup_swapchain();
+            let _ = self.device.device_wait_idle();
+        }
+        unsafe {
+            ManuallyDrop::drop(renderer);
+            {
+                let mut allocator = self.allocator.lock().expect("cannot lock allocator");
+                self.cleanup_swapchain(&mut allocator, buffers);
 
-            self.device.destroy_sampler(self.texture_sampler, None);
-            self.device
-                .destroy_image_view(self.texture_image_view, None);
+                self.device.destroy_sampler(self.texture_sampler, None);
+                self.device
+                    .destroy_image_view(buffers.texture.image_view, None);
 
-            self.device.destroy_image(self.texture_image, None);
-            self.device.free_memory(self.texture_image_memory, None);
+                allocator.destroy_image(buffers.texture.image, &mut buffers.texture.allocation);
 
-            zip(&self.uniform_buffers, &self.uniform_buffers_memory).for_each(
-                |(&uniform_buffer, &uniform_buffer_memory)| {
-                    self.device.destroy_buffer(uniform_buffer, None);
-                    self.device.free_memory(uniform_buffer_memory, None);
-                },
-            );
+                buffers.uniforms.iter_mut().for_each(|uniform_buffer| {
+                    allocator.unmap_memory(&mut uniform_buffer.allocation);
+                    allocator.destroy_buffer(uniform_buffer.buffer, &mut uniform_buffer.allocation);
+                });
 
-            self.device
-                .destroy_descriptor_pool(self.descriptor_pool, None);
-            self.device
-                .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
+                self.device
+                    .destroy_descriptor_pool(self.descriptor_pool, None);
+                self.device
+                    .destroy_descriptor_set_layout(self.descriptor_set_layout, None);
 
-            self.device.destroy_buffer(self.index_buffer, None);
-            self.device.free_memory(self.index_buffer_memory, None);
-
-            self.device.destroy_buffer(self.vertex_buffer, None);
-            self.device.free_memory(self.vertex_buffer_memory, None);
+                allocator.destroy_buffer(buffers.index.buffer, &mut buffers.index.allocation);
+                allocator.destroy_buffer(buffers.vertex.buffer, &mut buffers.vertex.allocation);
+            }
+            drop(self.allocator);
 
             self.device.destroy_pipeline(self.graphics_pipeline, None);
             self.device
@@ -2156,7 +2152,12 @@ impl Vulkan {
         }
     }
 
-    fn update_uniform_buffer(&self, current_image: u32, frame_data: &FrameData) {
+    fn update_uniform_buffer(
+        &self,
+        current_image: u32,
+        frame_data: &FrameData,
+        buffers: &VulkanBuffers,
+    ) {
         let start_time = *START_TIME;
         let current_time = Instant::now();
         let time = current_time - start_time;
@@ -2179,7 +2180,7 @@ impl Vulkan {
 
         unsafe {
             Self::copy_to_ptr(
-                self.uniform_buffers_mapped[current_image as usize],
+                buffers.uniforms[current_image as usize].ptr,
                 &[ubo],
                 size_of::<UniformBufferObject>() as vk::DeviceSize,
             );
@@ -2191,6 +2192,7 @@ impl Vulkan {
         renderer: &mut ImguiRenderer,
         draw_data: &DrawData,
         frame_data: &FrameData,
+        buffers: &mut VulkanBuffers,
     ) -> Result<(), vk::Result> {
         if !self.is_rendering {
             return Result::Ok(());
@@ -2212,7 +2214,7 @@ impl Vulkan {
             );
             let image_index = match image_index_result {
                 Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => {
-                    self.recreate_swapchain(window)?;
+                    self.recreate_swapchain(window, buffers)?;
                     None
                 }
                 Err(_) => {
@@ -2225,7 +2227,7 @@ impl Vulkan {
                 return Result::Ok(());
             }
 
-            self.update_uniform_buffer(self.current_frame as u32, frame_data);
+            self.update_uniform_buffer(self.current_frame as u32, frame_data, buffers);
 
             // Only reset the fence if we are submitting work
             self.device
@@ -2238,7 +2240,7 @@ impl Vulkan {
             image_index.unwrap()
         };
 
-        self.record_command_buffer(image_index, renderer, draw_data, frame_data)?;
+        self.record_command_buffer(image_index, renderer, draw_data, frame_data, buffers)?;
 
         let wait_semaphores = [self.image_available_semaphores[self.current_frame]];
         let wait_stages = [vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT];
@@ -2272,7 +2274,7 @@ impl Vulkan {
         match present_result {
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) | Err(vk::Result::SUBOPTIMAL_KHR) => {
                 self.framebuffer_resized = false;
-                self.recreate_swapchain(window)?;
+                self.recreate_swapchain(window, buffers)?;
             }
             Err(_) => {
                 present_result?;
@@ -2280,21 +2282,25 @@ impl Vulkan {
             Ok(_) => {}
         }
         if self.framebuffer_resized {
-            self.recreate_swapchain(window)?;
+            self.recreate_swapchain(window, buffers)?;
         }
 
         self.current_frame = (self.current_frame + 1) % (MAX_FRAMES_IN_FLIGHT as usize);
         Result::Ok(())
     }
 
-    fn cleanup_swapchain(&self) {
+    fn cleanup_swapchain(
+        &self,
+        allocator: &mut MutexGuard<Allocator>,
+        buffers: &mut VulkanBuffers,
+    ) {
         unsafe {
-            self.device.destroy_image_view(self.color_image_view, None);
-            self.device.destroy_image(self.color_image, None);
-            self.device.free_memory(self.color_image_memory, None);
-            self.device.destroy_image_view(self.depth_image_view, None);
-            self.device.destroy_image(self.depth_image, None);
-            self.device.free_memory(self.depth_image_memory, None);
+            self.device
+                .destroy_image_view(buffers.color.image_view, None);
+            allocator.destroy_image(buffers.color.image, &mut buffers.color.allocation);
+            self.device
+                .destroy_image_view(buffers.depth.image_view, None);
+            allocator.destroy_image(buffers.depth.image, &mut buffers.depth.allocation);
         }
 
         self.swapchain_framebuffers.iter().for_each(|&framebuffer| {
@@ -2311,12 +2317,18 @@ impl Vulkan {
         }
     }
 
-    pub fn recreate_swapchain(&mut self, window: &Window) -> Result<(), vk::Result> {
+    pub fn recreate_swapchain(
+        &mut self,
+        window: &Window,
+        buffers: &mut VulkanBuffers,
+    ) -> Result<(), vk::Result> {
         unsafe {
             self.device.device_wait_idle()?;
         }
 
-        self.cleanup_swapchain();
+        let allocator_mutex = self.allocator.clone();
+        let mut allocator = allocator_mutex.lock().expect("cannot lock allocator");
+        self.cleanup_swapchain(&mut allocator, buffers);
 
         let (
             swapchain_device,
@@ -2339,9 +2351,9 @@ impl Vulkan {
         self.swapchain_extent = swapchain_extent;
 
         self.create_image_views()?;
-        self.create_color_resources().unwrap();
-        self.create_depth_resources().unwrap();
-        self.create_framebuffers()?;
+        buffers.color = self.create_color_resources(&mut allocator).unwrap();
+        buffers.depth = self.create_depth_resources(&mut allocator).unwrap();
+        self.create_framebuffers(buffers.color.image_view, buffers.depth.image_view)?;
 
         Result::Ok(())
     }
@@ -2360,15 +2372,5 @@ impl Vulkan {
         unsafe {
             let _ = self.device.device_wait_idle();
         }
-    }
-}
-
-impl Drop for Vulkan {
-    fn drop(&mut self) {
-        log::debug!("Destroying Vulkan...");
-        unsafe {
-            let _ = self.device.device_wait_idle();
-        }
-        self.cleanup();
     }
 }

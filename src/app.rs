@@ -1,3 +1,4 @@
+use crate::buffer::VulkanBuffers;
 use crate::ui::UiBuilder;
 use crate::vulkan::Vulkan;
 use imgui::{FontConfig, FontSource};
@@ -8,14 +9,16 @@ use winit::event::WindowEvent;
 use winit::event_loop::ActiveEventLoop;
 use winit::window::{Window, WindowId};
 
+use std::mem::ManuallyDrop;
 use std::process;
 use std::time::{Duration, Instant};
 
 struct AppContext {
     imgui: imgui::Context,
-    imgui_renderer: Renderer,
+    imgui_renderer: ManuallyDrop<Renderer>,
     platform: WinitPlatform,
     vulkan: Vulkan,
+    buffers: VulkanBuffers,
     window: Window,
 }
 
@@ -43,13 +46,14 @@ impl AppContext {
     }
 
     fn init(event_loop: &ActiveEventLoop) -> Result<AppContext, Box<dyn std::error::Error>> {
-        let (window, vulkan) = Vulkan::new(event_loop)?;
+        let (window, vulkan, buffers) = Vulkan::new(event_loop)?;
         let (mut imgui, platform) = Self::init_imgui(&window)?;
         let imgui_renderer = vulkan.init_imgui_renderer(&mut imgui)?;
 
         Result::Ok(AppContext {
-            imgui_renderer,
+            imgui_renderer: ManuallyDrop::new(imgui_renderer),
             vulkan,
+            buffers,
             window,
             imgui,
             platform,
@@ -97,6 +101,7 @@ impl App {
                     &mut context.imgui_renderer,
                     imgui_draw_data,
                     &self.ui_builder.frame_data(),
+                    &mut context.buffers,
                 )
                 .unwrap_or_else(|err| {
                     eprintln!("{err}");
@@ -152,9 +157,10 @@ impl ApplicationHandler for App {
         match event {
             WindowEvent::CloseRequested => {
                 log::info!("The close button was pressed; stopping");
-                if let Some(context) = &mut self.context {
-                    context.vulkan.wait();
-                    self.context = None;
+                let context: Option<AppContext> = std::mem::replace(&mut self.context, None);
+                if let Some(mut context) = context {
+                    let vulkan: Vulkan = context.vulkan;
+                    vulkan.cleanup(&mut context.buffers, &mut context.imgui_renderer);
                 }
                 event_loop.exit();
             }
@@ -168,7 +174,7 @@ impl ApplicationHandler for App {
                 if let Some(context) = &mut self.context {
                     context
                         .vulkan
-                        .recreate_swapchain(&context.window)
+                        .recreate_swapchain(&context.window, &mut context.buffers)
                         .unwrap_or_else(|err| {
                             eprintln!("{err}");
                             process::exit(1);

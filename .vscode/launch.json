@@ -17,7 +17,6 @@
                 }
             },
             "args": [],
-            "preLaunchTask": "installtool",
             "cwd": "${workspaceFolder}"
         }
     ]
