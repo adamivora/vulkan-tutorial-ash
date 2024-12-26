@@ -3,7 +3,7 @@ The [Vulkan tutorial](https://vulkan-tutorial.com/) reimplemented in Rust, with 
 
 ## Extras
 - All allocations done using [vk-mem](https://github.com/gwihlidal/vk-mem-rs).
-- A Rust reimplementation of the imgui CameraWidget from [nvpro_core](https://github.com/nvpro-samples/nvpro_core). 
+- A Rust reimplementation of the imgui CameraWidget from [nvpro_core](https://github.com/nvpro-samples/nvpro_core), includes keyboard + mouse camera control. 
 - A minimal .obj loader is included.
 
 ## Crates
