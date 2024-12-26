@@ -222,7 +222,7 @@ pub struct Vulkan {
     swapchain: vk::SwapchainKHR,
     swapchain_images: Vec<vk::Image>,
     swapchain_image_format: vk::Format,
-    swapchain_extent: vk::Extent2D,
+    pub swapchain_extent: vk::Extent2D,
     swapchain_image_views: Vec<vk::ImageView>,
     swapchain_framebuffers: Vec<vk::Framebuffer>,
     render_pass: vk::RenderPass,
@@ -2169,9 +2169,9 @@ impl Vulkan {
         };
         let ubo = UniformBufferObject {
             model,
-            view: Mat4::look_at_rh(frame_data.cam_eye, frame_data.cam_center, frame_data.cam_up),
+            view: frame_data.cam_matrix,
             proj: Mat4::perspective_rh(
-                45.0_f32.to_radians(),
+                frame_data.cam_fov.to_radians(),
                 self.swapchain_extent.width as f32 / self.swapchain_extent.height as f32,
                 frame_data.cam_nearfar.x,
                 frame_data.cam_nearfar.y,

@@ -1,6 +1,7 @@
 pub mod app;
 pub mod buffer;
 pub mod frame_data;
+pub mod imgui;
 pub mod obj_loader;
 pub mod ui;
 pub mod vulkan;

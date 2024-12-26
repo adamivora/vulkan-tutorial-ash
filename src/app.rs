@@ -1,12 +1,15 @@
 use crate::buffer::VulkanBuffers;
+use crate::imgui::camera_manipulator::{Inputs, CAMERA_MANIPULATOR_INSTANCE};
 use crate::ui::UiBuilder;
 use crate::vulkan::Vulkan;
 use imgui::{FontConfig, FontSource};
 use imgui_rs_vulkan_renderer::Renderer;
 use imgui_winit_support::{HiDpiMode, WinitPlatform};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::dpi::PhysicalPosition;
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
+use winit::keyboard::NamedKey;
 use winit::window::{Window, WindowId};
 
 use std::mem::ManuallyDrop;
@@ -63,8 +66,10 @@ impl AppContext {
 
 pub struct App {
     context: Option<AppContext>,
+    mouse_position: PhysicalPosition<f64>,
     frame_start: std::time::Instant,
     ui_builder: Box<dyn UiBuilder>,
+    key_state: Inputs,
 }
 
 impl App {
@@ -73,6 +78,8 @@ impl App {
             context: None,
             frame_start: Instant::now(),
             ui_builder: Box::new(ui_builder),
+            mouse_position: PhysicalPosition::default(),
+            key_state: Inputs::default(),
         }
     }
 
@@ -90,9 +97,13 @@ impl App {
 
     fn render(&mut self) {
         if let Some(context) = &mut self.context {
-            let ui = context.imgui.frame();
+            let ui = context.imgui.new_frame();
             self.ui_builder.build(ui);
             context.platform.prepare_render(ui, &context.window);
+            CAMERA_MANIPULATOR_INSTANCE
+                .lock()
+                .expect("cannot lock mutex")
+                .update_anim();
             let imgui_draw_data = context.imgui.render();
             context
                 .vulkan
@@ -128,6 +139,13 @@ impl ApplicationHandler for App {
         });
         self.context = Some(context);
         if let Some(context) = &mut self.context {
+            let mut camera_m = CAMERA_MANIPULATOR_INSTANCE
+                .lock()
+                .expect("cannot lock mutex");
+            camera_m.set_window_size(
+                context.vulkan.swapchain_extent.width,
+                context.vulkan.swapchain_extent.height,
+            );
             context.window.request_redraw();
         }
     }
@@ -153,8 +171,13 @@ impl ApplicationHandler for App {
         }
     }
 
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
-        match event {
+    fn window_event(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        _id: WindowId,
+        window_event: WindowEvent,
+    ) {
+        match window_event {
             WindowEvent::CloseRequested => {
                 log::info!("The close button was pressed; stopping");
                 let context: Option<AppContext> = std::mem::replace(&mut self.context, None);
@@ -169,6 +192,7 @@ impl ApplicationHandler for App {
                 if let Some(context) = &mut self.context {
                     context.window.request_redraw();
                 }
+                self.pass_event_to_platform(window_event);
             }
             WindowEvent::Resized(_) => {
                 if let Some(context) = &mut self.context {
@@ -179,18 +203,117 @@ impl ApplicationHandler for App {
                             eprintln!("{err}");
                             process::exit(1);
                         });
+                    CAMERA_MANIPULATOR_INSTANCE
+                        .lock()
+                        .expect("cannot lock mutex")
+                        .set_window_size(
+                            context.vulkan.swapchain_extent.width,
+                            context.vulkan.swapchain_extent.height,
+                        );
                 }
-                self.pass_event_to_platform(event);
+                self.pass_event_to_platform(window_event);
             }
             WindowEvent::Occluded(true) => {
                 if let Some(context) = &mut self.context {
                     context.vulkan.pause_rendering();
                 }
+                self.pass_event_to_platform(window_event);
             }
             WindowEvent::Occluded(false) => {
                 if let Some(context) = &mut self.context {
                     context.vulkan.resume_rendering();
                 }
+                self.pass_event_to_platform(window_event);
+            }
+            WindowEvent::KeyboardInput {
+                device_id: _,
+                ref event,
+                is_synthetic: _,
+            } => {
+                if let Some(context) = &self.context {
+                    if context.imgui.io().want_capture_keyboard {
+                        self.pass_event_to_platform(window_event);
+                        return;
+                    }
+                }
+
+                let key_state = &mut self.key_state;
+                let pressed = event.state == ElementState::Pressed;
+                match event.logical_key {
+                    winit::keyboard::Key::Named(NamedKey::Shift) => key_state.shift = pressed,
+                    winit::keyboard::Key::Named(NamedKey::Alt) => key_state.alt = pressed,
+                    winit::keyboard::Key::Named(NamedKey::Control) => key_state.ctrl = pressed,
+                    _ => {}
+                }
+                self.pass_event_to_platform(window_event);
+            }
+            WindowEvent::CursorMoved {
+                device_id: _,
+                position,
+            } => {
+                self.mouse_position = position;
+                CAMERA_MANIPULATOR_INSTANCE
+                    .lock()
+                    .expect("cannot unlock mutex")
+                    .mouse_move(
+                        self.mouse_position.x as f32,
+                        self.mouse_position.y as f32,
+                        &self.key_state,
+                    );
+
+                self.pass_event_to_platform(window_event);
+            }
+            WindowEvent::MouseInput {
+                device_id: _,
+                state,
+                button,
+            } => {
+                if let Some(context) = &self.context {
+                    if context.imgui.io().want_capture_mouse {
+                        self.pass_event_to_platform(window_event);
+                        return;
+                    }
+                }
+
+                let key_state = &mut self.key_state;
+                let pressed = state == ElementState::Pressed;
+                let mut mouse_down = true;
+                match button {
+                    MouseButton::Left => key_state.lmb = pressed,
+                    MouseButton::Right => key_state.rmb = pressed,
+                    MouseButton::Middle => key_state.mmb = pressed,
+                    _ => mouse_down = false,
+                }
+                if pressed && mouse_down {
+                    CAMERA_MANIPULATOR_INSTANCE
+                        .lock()
+                        .expect("cannot unlock mutex")
+                        .set_mouse_position(
+                            self.mouse_position.x as f32,
+                            self.mouse_position.y as f32,
+                        );
+                }
+            }
+            WindowEvent::MouseWheel {
+                device_id: _,
+                delta,
+                phase: _,
+            } => {
+                if let Some(context) = &self.context {
+                    if context.imgui.io().want_capture_mouse {
+                        self.pass_event_to_platform(window_event);
+                        return;
+                    }
+                }
+
+                let mut camera_m = CAMERA_MANIPULATOR_INSTANCE
+                    .lock()
+                    .expect("cannot unlock mutex");
+                let delta_positive = match delta {
+                    MouseScrollDelta::LineDelta(_x, y) => y > 0.0,
+                    MouseScrollDelta::PixelDelta(PhysicalPosition { x: _, y }) => y > 0.0,
+                };
+                camera_m.wheel(if delta_positive { 1 } else { -1 }, self.key_state);
             }
             event => {
                 self.pass_event_to_platform(event);
