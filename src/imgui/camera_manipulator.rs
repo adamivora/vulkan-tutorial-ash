@@ -155,7 +155,7 @@ impl CameraManipulator {
         }
 
         let dx = dx * f32::consts::TAU;
-        let dy = dx * f32::consts::TAU;
+        let dy = dy * f32::consts::TAU;
 
         let origin = if invert {
             self.current.eye
@@ -173,7 +173,7 @@ impl CameraManipulator {
         let center_to_eye = center_to_eye.normalize();
         let axe_z = center_to_eye;
 
-        let rot_y = Mat4::from_axis_angle(self.current.up, -dx);
+        let rot_y = Mat4::from_axis_angle(self.current.up.normalize(), -dx);
         let center_to_eye = (rot_y * Vec4::from((center_to_eye, 0.0))).xyz();
 
         let axe_x = Vec3::cross(self.current.up, axe_z).normalize();
