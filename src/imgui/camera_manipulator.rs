@@ -218,7 +218,7 @@ impl CameraManipulator {
                 return;
             }
 
-            z *= factor;
+            z *= factor * 500.0;
         } else {
             z *= factor / length * 10.0;
         }

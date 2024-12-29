@@ -309,11 +309,28 @@ impl ApplicationHandler for App {
                 let mut camera_m = CAMERA_MANIPULATOR_INSTANCE
                     .lock()
                     .expect("cannot unlock mutex");
-                let delta_positive = match delta {
-                    MouseScrollDelta::LineDelta(_x, y) => y > 0.0,
-                    MouseScrollDelta::PixelDelta(PhysicalPosition { x: _, y }) => y > 0.0,
+                let delta = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        if x.abs() > y.abs() {
+                            x
+                        } else {
+                            y
+                        }
+                    }
+                    MouseScrollDelta::PixelDelta(PhysicalPosition { x, y }) => {
+                        if x.abs() > y.abs() {
+                            x as f32
+                        } else {
+                            y as f32
+                        }
+                    }
                 };
-                camera_m.wheel(if delta_positive { 1 } else { -1 }, self.key_state);
+                let delta = if delta == 0.0 {
+                    0
+                } else {
+                    delta.signum() as i32
+                };
+                camera_m.wheel(delta, self.key_state);
             }
             event => {
                 self.pass_event_to_platform(event);
