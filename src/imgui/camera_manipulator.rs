@@ -107,7 +107,26 @@ impl Default for CameraManipulator {
 
 impl CameraManipulator {
     fn update(&mut self) {
-        self.matrix = Mat4::look_at_rh(self.current.eye, self.current.center, self.current.up);
+        let eye = self.current.eye;
+        let dir = self.current.center - eye;
+        let up = self.current.up;
+
+        let f = dir.normalize();
+        let s = f.cross(up).normalize();
+        let s = if s.is_nan() {
+            let up = up + 0.5 * Vec3::NEG_X;
+            f.cross(up).normalize()
+        } else {
+            s
+        };
+        let u = s.cross(f);
+
+        self.matrix = Mat4::from_cols(
+            Vec4::new(s.x, u.x, -f.x, 0.0),
+            Vec4::new(s.y, u.y, -f.y, 0.0),
+            Vec4::new(s.z, u.z, -f.z, 0.0),
+            Vec4::new(-eye.dot(s), -eye.dot(u), eye.dot(f), 1.0),
+        );
     }
 
     fn pan(&mut self, dx: f32, dy: f32) {
